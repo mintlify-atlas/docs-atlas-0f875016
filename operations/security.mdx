@@ -1,0 +1,256 @@
+---
+title: "Security"
+description: "JWT authentication flow, BCrypt password hashing, and OAuth2 Resource Server configuration."
+---
+
+## Security Model
+
+The ecosystem uses a layered security model:
+
+<CardGroup cols={3}>
+  <Card title="BCrypt Hashing" icon="lock">
+    Passwords are stored as BCrypt hashes in the auth-service H2 database. Plaintext passwords are never persisted.
+  </Card>
+  <Card title="JWT Tokens" icon="key">
+    On successful login, auth-service issues a signed HS384 JWT valid for 1 hour. The token carries the username and roles.
+  </Card>
+  <Card title="OAuth2 Validation" icon="shield">
+    Every service that receives requests (api-gateway, inventory-service) validates the JWT signature against the shared secret before allowing access.
+  </Card>
+</CardGroup>
+
+## Authentication Flow
+
+<Steps>
+  <Step title="Client sends credentials">
+    The client POSTs username and password to the auth-service via the gateway:
+
+    ```bash
+    curl -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}'
+    ```
+
+    The `/auth/**` path is permit-all on both the gateway and auth-service, so no token is required for this step.
+  </Step>
+  <Step title="auth-service validates credentials and generates JWT">
+    `auth-service` looks up the user, verifies the BCrypt hash with `BCryptPasswordEncoder`, then calls `JwtService.generateToken()`:
+
+    ```java
+    // JwtService.java
+    public String generateToken(String username, List<String> roles) {
+        return Jwts.builder()
+                .subject(username)
+                .claim("roles", roles)
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + expirationMs))
+                .signWith(secretKey)   // HMAC-SHA384 key derived from jwt.secret
+                .compact();
+    }
+    ```
+
+    The response contains the token, type, and expiry:
+
+    ```json
+    {
+      "token": "eyJhbGciOiJIUzM4NCJ9...",
+      "type": "Bearer",
+      "expiresIn": 3600
+    }
+    ```
+  </Step>
+  <Step title="Client includes token in subsequent requests">
+    All subsequent requests must include the token in the `Authorization` header:
+
+    ```bash
+    curl -X GET http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer eyJhbGciOiJIUzM4NCJ9..."
+    ```
+  </Step>
+  <Step title="api-gateway validates the JWT">
+    The gateway's `SecurityConfig` acts as an **OAuth2 Resource Server** using Spring WebFlux. It decodes and validates the JWT before routing:
+
+    ```java
+    // api-gateway SecurityConfig.java
+    @Bean
+    public ReactiveJwtDecoder reactiveJwtDecoder() {
+        SecretKey key = new SecretKeySpec(
+            jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA384");
+        return NimbusReactiveJwtDecoder
+            .withSecretKey(key)
+            .macAlgorithm(MacAlgorithm.HS384)
+            .build();
+    }
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+            .authorizeExchange(exchange -> exchange
+                .pathMatchers("/auth/**").permitAll()
+                .pathMatchers("/actuator/**", "/h2-console/**").permitAll()
+                .anyExchange().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.jwtDecoder(reactiveJwtDecoder()))
+            )
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .build();
+    }
+    ```
+
+    If validation fails the gateway returns `401 Unauthorized` immediately, without forwarding the request.
+  </Step>
+  <Step title="AuthorizationHeaderGatewayFilterFactory propagates the header">
+    After validation, the `AuthorizationHeaderGatewayFilterFactory` filter (applied to all routes) explicitly copies the `Authorization` header to the mutated downstream request:
+
+    ```java
+    // AuthorizationHeaderGatewayFilterFactory.java
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            Optional<String> authHeader = exchange.getRequest()
+                .getHeaders().getOrEmpty(AUTHORIZATION).stream().findFirst();
+
+            if (authHeader.isPresent()) {
+                ServerHttpRequest mutatedRequest = exchange.getRequest().mutate()
+                    .header(AUTHORIZATION, authHeader.get())
+                    .build();
+                return chain.filter(exchange.mutate().request(mutatedRequest).build());
+            }
+            return chain.filter(exchange);
+        };
+    }
+    ```
+
+    This ensures downstream services receive the original `Bearer` token.
+  </Step>
+  <Step title="inventory-service re-validates the JWT">
+    The `inventory-service` also runs as an OAuth2 Resource Server (standard servlet-based Spring Security) and validates the JWT independently on every request:
+
+    ```java
+    // inventory-service SecurityConfig.java
+    @Bean
+    public JwtDecoder jwtDecoder() {
+        SecretKey key = new SecretKeySpec(
+            jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA384");
+        return NimbusJwtDecoder
+            .withSecretKey(key)
+            .macAlgorithm(MacAlgorithm.HS384)
+            .build();
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/h2-console/**", "/actuator/**").permitAll()
+                .requestMatchers("/api/inventory/**").authenticated()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.decoder(jwtDecoder()))
+            )
+            .headers(headers -> headers
+                .frameOptions(frame -> frame.sameOrigin())
+            );
+        return http.build();
+    }
+    ```
+  </Step>
+</Steps>
+
+## JWT Details
+
+| Property | Value |
+|----------|-------|
+| Algorithm | HS384 (HMAC SHA-384) |
+| Expiration | 3,600,000 ms (1 hour) — configurable via `jwt.expiration-ms` |
+| Claims | `sub` (username), `roles` (list of role names), `iat`, `exp` |
+| Library | `io.jsonwebtoken` (jjwt) |
+
+## JWT Secret
+
+<Warning>
+The `jwt.secret` value **must be identical** in all three services. A mismatch causes every token validation to fail with a `401 Unauthorized` after the client has successfully logged in.
+
+Services that must share the secret:
+- `auth-service` (signs tokens)
+- `api-gateway` (validates tokens)
+- `inventory-service` (validates tokens)
+</Warning>
+
+The secret is set in each service's `application.yml`:
+
+```yaml
+# auth-service, api-gateway, inventory-service — all three must match
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+```
+
+`auth-service` additionally reads `jwt.expiration-ms` (the other two services ignore it):
+
+```yaml
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+  expiration-ms: 3600000  # only used by auth-service
+```
+
+## BCrypt Password Hashing
+
+The `auth-service` uses Spring Security's `BCryptPasswordEncoder`. No plaintext passwords are stored. The `DataInitializer` seeds the database on startup:
+
+```java
+// auth-service DataInitializer.java
+User admin = new User("admin", passwordEncoder.encode("admin123"));
+admin.addRole(roleRepository.findByName("ADMIN").orElseThrow());
+admin.addRole(roleRepository.findByName("USER").orElseThrow());
+userRepository.save(admin);
+
+User user = new User("user", passwordEncoder.encode("user123"));
+user.addRole(roleRepository.findByName("USER").orElseThrow());
+userRepository.save(user);
+```
+
+## Default Test Users
+
+| Username | Password | Roles |
+|----------|----------|-------|
+| `admin` | `admin123` | `ADMIN`, `USER` |
+| `user` | `user123` | `USER` |
+
+<Note>
+These users are created by `DataInitializer` on every startup (the H2 database is in-memory with `ddl-auto: create-drop`, so it resets on each restart).
+</Note>
+
+## H2 Console Access
+
+Both `auth-service` and `inventory-service` expose the H2 web console for development purposes. Security is explicitly bypassed for these paths:
+
+| Service | URL | JDBC URL |
+|---------|-----|----------|
+| auth-service | http://localhost:8083/h2-console | `jdbc:h2:mem:authdb` |
+| inventory-service | http://localhost:8082/h2-console | `jdbc:h2:mem:inventorydb` |
+
+Credentials: user `sa`, password empty.
+
+The `sameOrigin` frame options header is set to allow the H2 console iframe to load:
+
+```java
+.headers(headers -> headers
+    .frameOptions(frame -> frame.sameOrigin())
+);
+```
+
+## Production Hardening
+
+<Warning>
+The default configuration is tuned for development. Before deploying to any shared or production environment, apply all of the following changes.
+</Warning>
+
+- **Change the JWT secret.** Replace `MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789` with a cryptographically random string of at least 64 characters. Update it in all three services simultaneously.
+- **Lower tracing sampling.** Change `management.tracing.sampling.probability` from `1.0` to `0.1` (or lower) to avoid performance impact from 100% trace sampling.
+- **Enable HTTPS.** Configure TLS on the api-gateway. Do not expose services directly without TLS in production.
+- **Disable H2 console.** Set `spring.h2.console.enabled: false` in auth-service and inventory-service, or replace H2 with a production database.
+- **Restrict Actuator endpoints.** The current config permits `/actuator/**` without authentication. In production, secure actuator endpoints with Spring Security.
+- **Disable Elasticsearch security bypass.** The Docker Compose config sets `xpack.security.enabled: false`. Enable it in production.

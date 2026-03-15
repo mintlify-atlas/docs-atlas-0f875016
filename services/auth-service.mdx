@@ -1,0 +1,314 @@
+---
+title: "Auth Service"
+description: "JWT authentication service with BCrypt password hashing and in-memory H2 database."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8083**
+  </Card>
+  <Card title="H2 Console" icon="database">
+    [http://localhost:8083/h2-console](http://localhost:8083/h2-console)
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Auth Service issues JWT tokens via a single `POST /auth/login` endpoint. It stores users in an in-memory H2 database, hashes passwords with BCrypt, and signs tokens with HMAC-SHA384 (HS384). The generated token must be included as a `Bearer` header in all requests to protected services.
+
+## Login Endpoint
+
+**`POST /auth/login`**
+
+Accepts a JSON body with `username` and `password`. Returns a signed JWT token.
+
+### Request DTO
+
+```java
+package com.uade.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+
+public record LoginRequest(
+        @NotBlank(message = "Username is required") String username,
+        @NotBlank(message = "Password is required") String password
+) {}
+```
+
+### Response DTO
+
+```java
+package com.uade.auth.dto;
+
+public record TokenResponse(String token, String type, long expiresIn) {}
+```
+
+### Example
+
+<Tabs>
+  <Tab title="curl (Linux/macOS)">
+    ```bash
+    curl -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}'
+    ```
+  </Tab>
+  <Tab title="curl (Windows CMD)">
+    ```cmd
+    curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+    ```
+  </Tab>
+  <Tab title="PowerShell">
+    ```powershell
+    $response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" -Method POST -ContentType "application/json" -Body '{"username":"admin","password":"admin123"}'
+    $response.token
+    ```
+  </Tab>
+</Tabs>
+
+Expected response:
+
+```json
+{
+  "token": "eyJhbGciOiJIUzM4NCJ9...",
+  "type": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+## Controller
+
+```java
+package com.uade.auth.controller;
+
+import com.uade.auth.dto.LoginRequest;
+import com.uade.auth.dto.TokenResponse;
+import com.uade.auth.entity.User;
+import com.uade.auth.repository.UserRepository;
+import com.uade.auth.service.JwtService;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+    private final UserRepository userRepository;
+    private final PasswordEncoder passwordEncoder;
+    private final JwtService jwtService;
+
+    public AuthController(UserRepository userRepository,
+                          PasswordEncoder passwordEncoder,
+                          JwtService jwtService) {
+        this.userRepository = userRepository;
+        this.passwordEncoder = passwordEncoder;
+        this.jwtService = jwtService;
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<TokenResponse> login(@Valid @RequestBody LoginRequest request) {
+        return userRepository.findByUsername(request.username())
+                .filter(user -> passwordEncoder.matches(request.password(), user.getPassword()))
+                .map(user -> {
+                    List<String> roles = user.getRoles().stream()
+                            .map(r -> "ROLE_" + r.getName())
+                            .toList();
+                    String token = jwtService.generateToken(user.getUsername(), roles);
+                    return ResponseEntity.ok(new TokenResponse(token, "Bearer", 3600));
+                })
+                .orElse(ResponseEntity.status(401).build());
+    }
+}
+```
+
+## JWT Service
+
+Tokens are signed with HS384 and expire after 3,600,000 ms (1 hour).
+
+```java
+package com.uade.auth.service;
+
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import javax.crypto.SecretKey;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
+import java.util.List;
+
+@Service
+public class JwtService {
+
+    private final SecretKey secretKey;
+    private final long expirationMs;
+
+    public JwtService(@Value("${jwt.secret}") String secret,
+                      @Value("${jwt.expiration-ms:3600000}") long expirationMs) {
+        this.secretKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
+        this.expirationMs = expirationMs;
+    }
+
+    public String generateToken(String username, List<String> roles) {
+        return Jwts.builder()
+                .subject(username)
+                .claim("roles", roles)
+                .issuedAt(new Date())
+                .expiration(new Date(System.currentTimeMillis() + expirationMs))
+                .signWith(secretKey)
+                .compact();
+    }
+
+    public Claims parseToken(String token) {
+        return Jwts.parser()
+                .verifyWith(secretKey)
+                .build()
+                .parseSignedClaims(token)
+                .getPayload();
+    }
+
+    public boolean validateToken(String token, String username) {
+        try {
+            Claims claims = parseToken(token);
+            return claims.getSubject().equals(username) && !claims.getExpiration().before(new Date());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+## Security Configuration
+
+BCrypt is configured as the password encoder. The `/auth/**` and `/h2-console/**` paths are open without authentication:
+
+```java
+package com.uade.auth.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/auth/**", "/h2-console/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            .headers(headers -> headers
+                .frameOptions(frame -> frame.sameOrigin())
+            );
+
+        return http.build();
+    }
+}
+```
+
+## Default Users
+
+The `DataInitializer` seeds two users on every startup:
+
+| Username | Password  | Roles        |
+|----------|-----------|--------------|
+| `admin`  | `admin123`| ADMIN + USER |
+| `user`   | `user123` | USER         |
+
+Passwords are stored as BCrypt hashes. Source:
+
+```java
+if (userRepository.findByUsername("admin").isEmpty()) {
+    User admin = new User("admin", passwordEncoder.encode("admin123"));
+    admin.addRole(roleRepository.findByName("ADMIN").orElseThrow());
+    admin.addRole(roleRepository.findByName("USER").orElseThrow());
+    userRepository.save(admin);
+}
+
+if (userRepository.findByUsername("user").isEmpty()) {
+    User user = new User("user", passwordEncoder.encode("user123"));
+    user.addRole(roleRepository.findByName("USER").orElseThrow());
+    userRepository.save(user);
+}
+```
+
+## Application Configuration
+
+```yaml
+server:
+  port: 8083
+
+spring:
+  application:
+    name: auth-service
+  datasource:
+    url: jdbc:h2:mem:authdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+  expiration-ms: 3600000
+```
+
+## H2 Console
+
+Access the in-memory database for inspection:
+
+- URL: [http://localhost:8083/h2-console](http://localhost:8083/h2-console)
+- JDBC URL: `jdbc:h2:mem:authdb`
+- Username: `sa`
+- Password: _(empty)_
+
+<Note>
+  This is an isolated in-memory database. It contains only the `users` and `roles` tables for this service — it does not share data with `inventory-service`.
+</Note>
+
+## Shared JWT Secret
+
+The `jwt.secret` value must be **identical** across all services that validate tokens:
+
+<Warning>
+  If `auth-service`, `api-gateway`, and `inventory-service` do not share the same `jwt.secret`, token validation will fail with `401 Unauthorized` even for valid credentials.
+</Warning>
+
+```yaml
+# Must be the same in auth-service, api-gateway, and inventory-service
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+```

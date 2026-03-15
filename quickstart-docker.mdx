@@ -1,0 +1,185 @@
+---
+title: "Quickstart with Docker"
+description: "Run the full microservices ecosystem in minutes using Docker Compose."
+---
+
+Docker Compose is the recommended way to run this ecosystem. It handles service ordering, healthchecks, and broker selection automatically.
+
+## Prerequisites
+
+Before you start, make sure you have the following installed:
+
+- **Java 21**
+- **Maven 3.9+**
+- **[Docker Desktop](https://www.docker.com/products/docker-desktop/)** — must be running before you execute any commands. Verify the icon in your system tray does not say "starting..."
+
+## How startup ordering works
+
+The `docker-compose.yml` uses `depends_on` with `condition: service_healthy` to enforce the correct startup sequence. Each service only starts after its dependencies pass their healthchecks:
+
+1. `config-server` starts first (all services depend on it)
+2. `eureka-server` starts after `config-server` is healthy
+3. The message broker (RabbitMQ or Kafka) starts in parallel with infrastructure services
+4. `auth-service`, `api-gateway`, `inventory-service`, and `notification-service` start after `config-server`, `eureka-server`, and the broker are all healthy
+5. `zipkin`, `elasticsearch`, and `kibana` start independently or after their own dependencies
+
+You do not need to manually sequence anything — Docker Compose handles it.
+
+## Starting the ecosystem
+
+<Steps>
+  <Step title="Build all service JARs">
+    From the project root, compile and package all modules:
+
+    ```bash
+    mvn clean package -DskipTests
+    ```
+
+    This runs across all modules defined in the root `pom.xml` (config-server, eureka-server, auth-service, api-gateway, inventory-service, notification-service).
+  </Step>
+
+  <Step title="Choose your message broker and start">
+    Pick either RabbitMQ or Kafka. The chosen profile activates the matching broker container and configures the Spring `rabbitmq` or `kafka` profile on inventory-service and notification-service.
+
+    <Tabs>
+      <Tab title="RabbitMQ (recommended)">
+        ```bash
+        docker compose --profile rabbitmq up --build
+        ```
+
+        This starts: `rabbitmq`, `zipkin`, `elasticsearch`, `kibana`, `config-server`, `eureka-server`, `auth-service`, `api-gateway`, `inventory-service-rabbitmq`, `notification-service-rabbitmq`.
+      </Tab>
+      <Tab title="Apache Kafka">
+        ```bash
+        docker compose --profile kafka up --build
+        ```
+
+        This starts: `kafka` (KRaft mode, no Zookeeper), `zipkin`, `elasticsearch`, `kibana`, `config-server`, `eureka-server`, `auth-service`, `api-gateway`, `inventory-service-kafka`, `notification-service-kafka`.
+      </Tab>
+    </Tabs>
+
+    <Note>
+      Switching brokers requires no code changes. The Spring profile determines which messaging adapter is active. The domain and use case layers are broker-agnostic.
+    </Note>
+  </Step>
+
+  <Step title="Wait for services to become healthy">
+    Watch the Docker Compose output. Services print startup logs as they become ready. You can also poll the healthcheck endpoints:
+
+    ```bash
+    # Eureka dashboard — lists all registered services
+    curl http://localhost:8761/actuator/health
+
+    # Individual service health
+    curl http://localhost:8080/actuator/health  # API Gateway
+    curl http://localhost:8083/actuator/health  # Auth Service
+    curl http://localhost:8082/actuator/health  # Inventory Service
+    curl http://localhost:8084/actuator/health  # Notification Service
+    ```
+
+    Open the **Eureka dashboard** at [http://localhost:8761](http://localhost:8761) to confirm all services are registered.
+  </Step>
+
+  <Step title="Get a JWT token">
+    The API Gateway requires a Bearer token on all `/api/*` routes. Authenticate using the built-in `admin` account:
+
+    <CodeGroup>
+      ```bash Linux / macOS / Git Bash
+      TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+        -H "Content-Type: application/json" \
+        -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+      ```
+
+      ```cmd Windows CMD
+      curl -X POST http://localhost:8080/auth/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+      ```
+
+      ```powershell Windows PowerShell
+      $response = Invoke-RestMethod -Uri "http://localhost:8080/auth/login" -Method POST -ContentType "application/json" -Body '{"username":"admin","password":"admin123"}'
+      $token = $response.token
+      ```
+    </CodeGroup>
+
+    Expected response:
+
+    ```json
+    {
+      "token": "eyJhbGciOiJIUzM4NCJ9...",
+      "type": "Bearer",
+      "expiresIn": 3600
+    }
+    ```
+  </Step>
+
+  <Step title="Call the inventory API">
+    Use the token to call a protected endpoint:
+
+    <CodeGroup>
+      ```bash Linux / macOS / Git Bash
+      # List all products
+      curl -X GET http://localhost:8080/api/inventory/products \
+        -H "Authorization: Bearer $TOKEN"
+
+      # Create a product (triggers an async event to notification-service)
+      curl -X POST http://localhost:8080/api/inventory/products \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"Monitor","quantity":15,"price":299.99}'
+      ```
+
+      ```cmd Windows CMD
+      curl -X GET http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE"
+
+      curl -X POST http://localhost:8080/api/inventory/products -H "Authorization: Bearer TOKEN_HERE" -H "Content-Type: application/json" -d "{\"name\":\"Monitor\",\"quantity\":15,\"price\":299.99}"
+      ```
+
+      ```powershell Windows PowerShell
+      Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" -Headers @{ Authorization = "Bearer $token" }
+
+      Invoke-RestMethod -Uri "http://localhost:8080/api/inventory/products" -Method POST -ContentType "application/json" -Headers @{ Authorization = "Bearer $token" } -Body '{"name":"Monitor","quantity":15,"price":299.99}'
+      ```
+    </CodeGroup>
+
+    After creating a product, check the `notification-service` logs — it logs a notification when it consumes the event from the broker.
+  </Step>
+</Steps>
+
+## Stopping services
+
+Press `Ctrl+C` in the terminal where Docker Compose is running to stop containers, then run:
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    docker compose --profile rabbitmq down
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    docker compose --profile kafka down
+    ```
+  </Tab>
+</Tabs>
+
+`Ctrl+C` stops the containers. `docker compose down` also removes the containers and the Docker network created for this project.
+
+## Service URLs
+
+| Service | URL | Notes |
+|---|---|---|
+| API Gateway | http://localhost:8080 | Entry point for all API calls |
+| Eureka | http://localhost:8761 | Service registry dashboard |
+| Auth Service | http://localhost:8083 | JWT login endpoint |
+| Inventory Service | http://localhost:8082 | Direct access (bypasses gateway) |
+| Notification Service | http://localhost:8084 | Event consumer |
+| RabbitMQ Management | http://localhost:15672 | `guest` / `guest` |
+| Zipkin | http://localhost:9411 | Distributed tracing UI |
+| Elasticsearch | http://localhost:9200 | Log storage |
+| Kibana | http://localhost:5601 | Log visualization UI |
+
+## Test users
+
+| Username | Password | Roles |
+|---|---|---|
+| `admin` | `admin123` | ADMIN, USER |
+| `user` | `user123` | USER |

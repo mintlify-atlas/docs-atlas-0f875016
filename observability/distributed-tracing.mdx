@@ -1,0 +1,157 @@
+---
+title: "Distributed Tracing with Zipkin"
+description: "How Micrometer Tracing + Zipkin correlates requests across all microservices."
+---
+
+In a microservices architecture, a single user request can touch multiple services before returning a response. Without tracing, debugging a slow or failing request means manually correlating logs across services with no common thread. Distributed tracing solves this by assigning every request a unique `traceId` that propagates through every service it touches, grouping all related work into a single, navigable trace.
+
+This project uses **Micrometer Tracing** with a **Brave** bridge and **Zipkin** as the collection backend.
+
+## Stack
+
+| Component | Role |
+|-----------|------|
+| **Micrometer Tracing** | Tracing API for Spring Boot 3.x (replaces Spring Cloud Sleuth) |
+| **Brave** (`micrometer-tracing-bridge-brave`) | Implements the Micrometer Tracing bridge |
+| **Zipkin Reporter** (`zipkin-reporter-brave`) | Ships spans to the Zipkin server |
+| **Zipkin Server** | Collects, stores, and visualizes traces |
+
+## Service configuration
+
+Every participating service carries the following configuration in its `application.yml`:
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 1.0       # 100% sampling — for development only
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+```
+
+The `correlation` pattern prepends every log line with the service name, `traceId`, and `spanId`. This makes it possible to correlate service logs with Zipkin traces using only the `traceId`.
+
+<Note>
+  `sampling.probability: 1.0` traces every request. This is correct for development but will degrade performance under production load. Lower it to `0.1` (10%) or less before deploying to a production environment.
+</Note>
+
+When running in Docker, each service overrides the Zipkin endpoint so it resolves the container name rather than `localhost`:
+
+```yaml
+# Set via environment variable in docker-compose.yml
+MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+## Participating services
+
+| Service | Port | Role in a trace |
+|---------|------|-----------------|
+| `api-gateway` | 8080 | Root span — receives the inbound client request |
+| `auth-service` | 8083 | Child span — handles login and JWT issuance |
+| `inventory-service` | 8082 | Child span — handles product CRUD operations |
+| `notification-service` | 8084 | Child span — consumes async events from the broker |
+
+## Trace example: creating a product
+
+When a client sends `POST /api/inventory/products` with a JWT, the trace spans three services:
+
+```
+[api-gateway]  ──────────────────────────────────────────────── ~120ms
+   │
+   ├── [inventory-service]  ─────────────────────────────────── ~80ms
+   │       │
+   │       └── [notification-service]  ── (async event)         ~15ms
+```
+
+Each service logs its own portion with the shared `traceId`:
+
+```
+[api-gateway,6b3e44e01a7d4c00,6b3e44e01a7d4c00] GET /api/inventory/products
+[inventory-service,6b3e44e01a7d4c00,a1b2c3d4e5f60000] Returning 3 products
+```
+
+The same `6b3e44e01a7d4c00` traceId appears across both service logs, linking them to the same request.
+
+## Zipkin in Docker
+
+Zipkin is included in `docker-compose.yml` and starts automatically with either profile:
+
+```yaml
+zipkin:
+  image: openzipkin/zipkin:latest
+  ports:
+    - "9411:9411"
+  healthcheck:
+    test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O /dev/null http://localhost:9411/health || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+```
+
+All services declare `zipkin: condition: service_healthy` in their `depends_on` block, so Spring Boot services only start after Zipkin is ready to accept spans.
+
+## Using the Zipkin UI
+
+<Steps>
+  <Step title="Open the Zipkin UI">
+    Navigate to [http://localhost:9411](http://localhost:9411) in your browser.
+  </Step>
+
+  <Step title="Generate a trace">
+    Send a request through the API gateway to produce spans. For example, create a product:
+
+    ```bash
+    TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+    curl -X POST http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"name":"Monitor","quantity":15,"price":299.99}'
+    ```
+  </Step>
+
+  <Step title="Search for traces">
+    In the Zipkin UI:
+    - Select a **Service** from the dropdown (e.g., `api-gateway`)
+    - Click **Run Query** to list recent traces
+    - You can also search by duration range or paste a `traceId` directly into the search bar
+  </Step>
+
+  <Step title="Inspect a trace">
+    Click any trace in the results list. The detail view shows:
+    - Each span as a horizontal bar, sized by duration
+    - The parent–child relationship between spans across services
+    - Tags and annotations attached to each span (HTTP method, status code, etc.)
+  </Step>
+
+  <Step title="View the dependency diagram">
+    Click **Dependencies** in the top navigation. Zipkin renders a graph of which services called which, with call counts. This updates as new traces arrive.
+  </Step>
+
+  <Step title="Correlate with Kibana logs">
+    Copy the `traceId` from the Zipkin trace detail view. Open Kibana at [http://localhost:5601](http://localhost:5601), go to **Discover**, select the `logs-*` index pattern, and search:
+
+    ```
+    traceId: 6b3e44e01a7d4c00
+    ```
+
+    This returns every log line from every service that participated in that request.
+  </Step>
+</Steps>
+
+## Correlating traces with Kibana logs
+
+Because every log line includes the `traceId` via the `correlation` logging pattern, you can move fluidly between the two tools:
+
+- **Zipkin** shows you *which services* were involved, their latency, and the call graph
+- **Kibana** shows you *what happened inside each service* — full log messages, stack traces, and business data
+
+Use Zipkin first to identify the slow or failing span, then use the `traceId` in Kibana to read the full log context for that exact request.

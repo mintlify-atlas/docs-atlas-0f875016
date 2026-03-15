@@ -1,0 +1,303 @@
+---
+title: "Inventory API"
+description: "Product management endpoints, all protected by JWT Bearer token authentication."
+---
+
+<Warning>
+  Every inventory endpoint requires a valid JWT Bearer token in the `Authorization` header. Requests without a token, or with an expired or invalid token, receive a `401 Unauthorized` response. Obtain a token from the [Auth API](/api/auth) before calling any inventory endpoint.
+</Warning>
+
+All examples below route through the API Gateway at `http://localhost:8080`. See [Direct access](#direct-access) if you need to call the inventory service without the gateway.
+
+---
+
+## GET /api/inventory/products
+
+Returns a list of all products in the inventory.
+
+**Endpoint (via API Gateway)**
+
+```
+GET http://localhost:8080/api/inventory/products
+```
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/auth/login`. Format: `Bearer <token>`.
+</ParamField>
+
+### Response body (200)
+
+An array of Product objects.
+
+<ResponseField name="id" type="number">
+  Auto-generated product identifier.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Product name.
+</ResponseField>
+
+<ResponseField name="quantity" type="number">
+  Available stock quantity (integer).
+</ResponseField>
+
+<ResponseField name="price" type="number">
+  Product price (double).
+</ResponseField>
+
+### Examples
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer <token>"
+```
+
+```bash Windows CMD
+curl http://localhost:8080/api/inventory/products ^
+  -H "Authorization: Bearer <token>"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri http://localhost:8080/api/inventory/products `
+  -Headers @{ Authorization = "Bearer <token>" }
+```
+
+</CodeGroup>
+
+```json Response
+[
+  {
+    "id": 1,
+    "name": "Producto Test",
+    "quantity": 10,
+    "price": 99.99
+  }
+]
+```
+
+---
+
+## GET /api/inventory/products/{id}
+
+Returns a single product by its ID.
+
+**Endpoint (via API Gateway)**
+
+```
+GET http://localhost:8080/api/inventory/products/{id}
+```
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/auth/login`. Format: `Bearer <token>`.
+</ParamField>
+
+### Path parameters
+
+<ParamField path="id" type="number" required>
+  The numeric ID (`Long`) of the product to retrieve.
+</ParamField>
+
+### Response body (200)
+
+<ResponseField name="id" type="number">
+  Auto-generated product identifier.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Product name.
+</ResponseField>
+
+<ResponseField name="quantity" type="number">
+  Available stock quantity (integer).
+</ResponseField>
+
+<ResponseField name="price" type="number">
+  Product price (double).
+</ResponseField>
+
+### Error responses
+
+| Status | Meaning |
+| ------ | ------- |
+| `401`  | Missing or invalid Bearer token. |
+| `404`  | No product found with the given ID. |
+
+### Examples
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl http://localhost:8080/api/inventory/products/1 \
+  -H "Authorization: Bearer <token>"
+```
+
+```bash Windows CMD
+curl http://localhost:8080/api/inventory/products/1 ^
+  -H "Authorization: Bearer <token>"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Uri http://localhost:8080/api/inventory/products/1 `
+  -Headers @{ Authorization = "Bearer <token>" }
+```
+
+</CodeGroup>
+
+```json Response
+{
+  "id": 1,
+  "name": "Producto Test",
+  "quantity": 10,
+  "price": 99.99
+}
+```
+
+---
+
+## POST /api/inventory/products
+
+Creates a new product and saves it to the inventory.
+
+**Endpoint (via API Gateway)**
+
+```
+POST http://localhost:8080/api/inventory/products
+```
+
+<Note>
+  After a product is created, a `ProductCreatedEvent` is published to the active message broker.
+</Note>
+
+### Headers
+
+<ParamField header="Authorization" type="string" required>
+  Bearer token obtained from `/auth/login`. Format: `Bearer <token>`.
+</ParamField>
+
+<ParamField header="Content-Type" type="string" required>
+  Must be `application/json`.
+</ParamField>
+
+### Request body
+
+<ParamField body="name" type="string" required>
+  Product name.
+</ParamField>
+
+<ParamField body="quantity" type="number" required>
+  Initial stock quantity (integer).
+</ParamField>
+
+<ParamField body="price" type="number" required>
+  Product price (double).
+</ParamField>
+
+### Response body (200)
+
+The created product, including its generated ID.
+
+<ResponseField name="id" type="number">
+  Auto-generated product identifier assigned by the database.
+</ResponseField>
+
+<ResponseField name="name" type="string">
+  Product name as provided in the request.
+</ResponseField>
+
+<ResponseField name="quantity" type="number">
+  Stock quantity as provided in the request.
+</ResponseField>
+
+<ResponseField name="price" type="number">
+  Product price as provided in the request.
+</ResponseField>
+
+### Error responses
+
+| Status | Meaning |
+| ------ | ------- |
+| `401`  | Missing or invalid Bearer token. |
+
+### Examples
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Producto Test", "quantity": 10, "price": 99.99}'
+```
+
+```bash Windows CMD
+curl -X POST http://localhost:8080/api/inventory/products ^
+  -H "Authorization: Bearer <token>" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"name\": \"Producto Test\", \"quantity\": 10, \"price\": 99.99}"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Method POST -Uri http://localhost:8080/api/inventory/products `
+  -Headers @{ Authorization = "Bearer <token>" } `
+  -ContentType "application/json" `
+  -Body '{"name": "Producto Test", "quantity": 10, "price": 99.99}'
+```
+
+</CodeGroup>
+
+```json Response
+{
+  "id": 2,
+  "name": "Producto Test",
+  "quantity": 10,
+  "price": 99.99
+}
+```
+
+---
+
+## Getting a token
+
+All inventory endpoints require a Bearer token. To obtain one:
+
+1. Call [POST /auth/login](/api/auth) with a valid username and password.
+2. Copy the `token` field from the response.
+3. Pass it in every inventory request as `Authorization: Bearer <token>`.
+
+Tokens expire after **1 hour**. Request a new one when you receive a `401` response.
+
+---
+
+## Direct access
+
+You can call the inventory service directly on port `8082`, bypassing the API Gateway. A valid Bearer token is still required.
+
+```
+http://localhost:8082/api/inventory/products
+```
+
+<Note>
+  Direct access is useful for local development and debugging. In production-like setups, always route through the gateway.
+</Note>
+
+### H2 console
+
+The inventory service exposes an in-memory H2 database console at:
+
+```
+http://localhost:8082/h2-console
+```
+
+Use the following connection settings:
+
+| Field    | Value |
+| -------- | ----- |
+| JDBC URL | `jdbc:h2:mem:inventorydb` |
+| Username | `sa` |
+| Password | *(leave blank)* |

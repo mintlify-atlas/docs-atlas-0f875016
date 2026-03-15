@@ -1,0 +1,390 @@
+---
+title: "Inventory Service"
+description: "Product management microservice built with Hexagonal Architecture, H2 persistence, and async event publishing."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8082**
+  </Card>
+  <Card title="H2 Console" icon="database">
+    [http://localhost:8082/h2-console](http://localhost:8082/h2-console)
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Inventory Service manages products. It exposes a REST API protected by JWT, persists data in an in-memory H2 database, and publishes a `ProductCreatedEvent` to the active message broker whenever a product is created.
+
+The service is structured with **Hexagonal (Ports and Adapters) Architecture**, keeping the domain model completely free of framework dependencies.
+
+## Hexagonal Architecture
+
+```
+inventory-service/src/main/java/com/uade/inventory/
+├── domain/                              ← Core (no framework dependencies)
+│   ├── model/
+│   │   └── Product.java                ← Pure POJO, no JPA annotations
+│   └── port/
+│       ├── in/
+│       │   └── ProductUseCase.java      ← Inbound port (interface)
+│       └── out/
+│           └── ProductRepositoryPort.java  ← Outbound port (interface)
+│
+├── application/                         ← Use Cases
+│   └── service/
+│       └── ProductService.java          ← Implements ProductUseCase
+│
+└── infrastructure/                      ← Adapters (Spring, JPA, HTTP)
+    ├── adapter/
+    │   ├── in/web/
+    │   │   └── InventoryController.java ← REST adapter
+    │   └── out/persistence/
+    │       ├── ProductJpaEntity.java
+    │       ├── ProductJpaRepository.java
+    │       ├── ProductPersistenceAdapter.java
+    │       └── ProductMapper.java
+    └── config/
+        ├── SecurityConfig.java
+        └── DataInitializer.java
+```
+
+## Domain Model
+
+The `Product` domain class is a pure POJO with no JPA annotations:
+
+```java
+package com.uade.inventory.domain.model;
+
+import java.util.Objects;
+
+public class Product {
+
+    private Long id;
+    private String name;
+    private Integer quantity;
+    private Double price;
+
+    public Product() {}
+
+    public Product(String name, Integer quantity, Double price) {
+        this.name = name;
+        this.quantity = quantity;
+        this.price = price;
+    }
+
+    public Product(Long id, String name, Integer quantity, Double price) {
+        this.id = id;
+        this.name = name;
+        this.quantity = quantity;
+        this.price = price;
+    }
+
+    public Long getId()         { return id; }
+    public String getName()     { return name; }
+    public Integer getQuantity(){ return quantity; }
+    public Double getPrice()    { return price; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Product product = (Product) o;
+        return Objects.equals(id, product.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
+    }
+}
+```
+
+| Field      | Type      | Description              |
+|------------|-----------|--------------------------|
+| `id`       | `Long`    | Auto-generated identifier|
+| `name`     | `String`  | Product name             |
+| `quantity` | `Integer` | Stock quantity           |
+| `price`    | `Double`  | Unit price               |
+
+## Inbound Port
+
+```java
+package com.uade.inventory.domain.port.in;
+
+import com.uade.inventory.domain.model.Product;
+
+import java.util.List;
+import java.util.Optional;
+
+public interface ProductUseCase {
+
+    List<Product> getAllProducts();
+
+    Optional<Product> getProductById(Long id);
+
+    Product createProduct(Product product);
+}
+```
+
+## Application Service
+
+`ProductService` implements the use case and publishes an event after saving a product:
+
+```java
+package com.uade.inventory.application.service;
+
+import com.uade.inventory.domain.event.ProductCreatedEvent;
+import com.uade.inventory.domain.model.Product;
+import com.uade.inventory.domain.port.in.ProductUseCase;
+import com.uade.inventory.domain.port.out.EventPublisherPort;
+import com.uade.inventory.domain.port.out.ProductRepositoryPort;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Optional;
+
+@Service
+public class ProductService implements ProductUseCase {
+
+    private final ProductRepositoryPort repositoryPort;
+    private final EventPublisherPort eventPublisherPort;
+
+    public ProductService(ProductRepositoryPort repositoryPort, EventPublisherPort eventPublisherPort) {
+        this.repositoryPort = repositoryPort;
+        this.eventPublisherPort = eventPublisherPort;
+    }
+
+    @Override
+    public List<Product> getAllProducts() {
+        return repositoryPort.findAll();
+    }
+
+    @Override
+    public Optional<Product> getProductById(Long id) {
+        return repositoryPort.findById(id);
+    }
+
+    @Override
+    public Product createProduct(Product product) {
+        Product saved = repositoryPort.save(product);
+        eventPublisherPort.publishProductCreated(
+                new ProductCreatedEvent(saved.getId(), saved.getName(), saved.getQuantity(), saved.getPrice())
+        );
+        return saved;
+    }
+}
+```
+
+The `EventPublisherPort` interface decouples the domain from the messaging infrastructure. The concrete adapter is activated by Spring profile:
+
+```
+EventPublisherPort (outbound port)
+    ├── RabbitMQPublisherAdapter  → @Profile("rabbitmq")
+    └── KafkaPublisherAdapter     → @Profile("kafka")
+```
+
+## REST Controller
+
+```java
+package com.uade.inventory.infrastructure.adapter.in.web;
+
+import com.uade.inventory.domain.model.Product;
+import com.uade.inventory.domain.port.in.ProductUseCase;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/inventory")
+public class InventoryController {
+
+    private final ProductUseCase productUseCase;
+
+    public InventoryController(ProductUseCase productUseCase) {
+        this.productUseCase = productUseCase;
+    }
+
+    @GetMapping("/products")
+    public ResponseEntity<List<Product>> getAllProducts() {
+        return ResponseEntity.ok(productUseCase.getAllProducts());
+    }
+
+    @GetMapping("/products/{id}")
+    public ResponseEntity<Product> getProduct(@PathVariable Long id) {
+        return productUseCase.getProductById(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/products")
+    public ResponseEntity<Product> createProduct(@RequestBody Product product) {
+        return ResponseEntity.ok(productUseCase.createProduct(product));
+    }
+}
+```
+
+## Endpoints
+
+All endpoints require a valid `Authorization: Bearer <token>` header.
+
+| Method | Path                         | Description            |
+|--------|------------------------------|------------------------|
+| GET    | `/api/inventory/products`    | List all products      |
+| GET    | `/api/inventory/products/{id}` | Get a product by ID  |
+| POST   | `/api/inventory/products`    | Create a new product   |
+
+### Create product example
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Monitor","quantity":15,"price":299.99}'
+```
+
+## Security Configuration
+
+The service is an independent OAuth2 Resource Server. It validates the JWT using the same shared HMAC-SHA384 secret:
+
+```java
+package com.uade.inventory.infrastructure.config;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+
+    @Bean
+    public JwtDecoder jwtDecoder() {
+        SecretKey key = new SecretKeySpec(jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA384");
+        return NimbusJwtDecoder.withSecretKey(key).macAlgorithm(MacAlgorithm.HS384).build();
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/h2-console/**", "/actuator/**").permitAll()
+                .requestMatchers("/api/inventory/**").authenticated()
+                .anyRequest().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.decoder(jwtDecoder()))
+            )
+            .headers(headers -> headers
+                .frameOptions(frame -> frame.sameOrigin())
+            );
+
+        return http.build();
+    }
+}
+```
+
+## Pre-loaded Data
+
+The `DataInitializer` seeds three products on every startup when the database is empty:
+
+```java
+@Override
+public void run(String... args) {
+    if (productRepositoryPort.count() == 0) {
+        productRepositoryPort.save(new Product("Laptop", 10, 999.99));
+        productRepositoryPort.save(new Product("Mouse", 50, 29.99));
+        productRepositoryPort.save(new Product("Teclado", 30, 79.99));
+    }
+}
+```
+
+## H2 Console
+
+- URL: [http://localhost:8082/h2-console](http://localhost:8082/h2-console)
+- JDBC URL: `jdbc:h2:mem:inventorydb`
+- Username: `sa`
+- Password: _(empty)_
+
+## Application Configuration
+
+```yaml
+server:
+  port: 8082
+
+spring:
+  application:
+    name: inventory-service
+  datasource:
+    url: jdbc:h2:mem:inventorydb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+```
+
+## Spring Profiles
+
+The messaging adapter is selected at runtime by a Spring profile:
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    ```
+    Activates `RabbitMQPublisherAdapter` — publishes `ProductCreatedEvent` to the `inventory.exchange` topic exchange.
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+    ```
+    Activates `KafkaPublisherAdapter` — publishes `ProductCreatedEvent` to the `product-created` Kafka topic.
+  </Tab>
+</Tabs>
+
+<Warning>
+  The `notification-service` must be started with the **same profile** as the inventory service, otherwise the consumer will not connect to the correct broker.
+</Warning>
+
+## Environment Variables
+
+| Variable                               | Description                                    |
+|----------------------------------------|------------------------------------------------|
+| `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | Eureka registry URL                            |
+| `JWT_SECRET`                           | HMAC-SHA384 secret (must match other services) |

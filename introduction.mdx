@@ -1,0 +1,98 @@
+---
+title: "Introduction"
+description: "A production-ready Spring Boot 3.4 / Java 21 microservices ecosystem with service discovery, JWT auth, event-driven messaging, distributed tracing, and centralized logging."
+---
+
+## What is Microservicios Ecosystem?
+
+Microservicios Ecosystem is a fully-featured reference implementation of a microservices architecture built on **Spring Boot 3.4** and **Java 21**. It demonstrates industry best practices including hexagonal architecture, event-driven design, distributed tracing, and centralized observability — all deployable with a single Docker Compose command.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart with Docker" icon="docker" href="/quickstart-docker">
+    Get the full ecosystem running in minutes using Docker Compose
+  </Card>
+  <Card title="Manual Setup" icon="terminal" href="/quickstart-manual">
+    Run services natively with lower memory requirements
+  </Card>
+  <Card title="Architecture Overview" icon="diagram-project" href="/architecture/overview">
+    Understand the system design and component relationships
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/auth">
+    Explore the REST endpoints for auth and inventory
+  </Card>
+</CardGroup>
+
+## Services at a glance
+
+| Service | Port | Role |
+|---|---|---|
+| **config-server** | 8888 | Centralized configuration (filesystem) |
+| **eureka-server** | 8761 | Service discovery registry |
+| **auth-service** | 8083 | JWT authentication + BCrypt |
+| **api-gateway** | 8080 | Routing + OAuth2 token validation |
+| **inventory-service** | 8082 | Product CRUD (hexagonal architecture) |
+| **notification-service** | 8084 | Async event consumer |
+| **RabbitMQ** | 5672 / 15672 | Message broker (option 1) |
+| **Apache Kafka** | 9092 | Message broker (option 2) |
+| **Zipkin** | 9411 | Distributed tracing UI |
+| **Elasticsearch** | 9200 | Log storage |
+| **Logstash** | 5044 | Log ingestion + parsing |
+| **Kibana** | 5601 | Log visualization UI |
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Hexagonal Architecture" icon="hexagon" href="/architecture/hexagonal">
+    inventory-service implements Ports & Adapters — swap databases or brokers without touching domain logic
+  </Card>
+  <Card title="Event-Driven Messaging" icon="bolt" href="/architecture/event-driven">
+    RabbitMQ and Kafka support via Spring Profiles — switch brokers without code changes
+  </Card>
+  <Card title="Distributed Tracing" icon="network-wired" href="/observability/distributed-tracing">
+    Micrometer Tracing + Zipkin correlates requests across all services
+  </Card>
+  <Card title="Centralized Logging" icon="magnifying-glass" href="/observability/elk-stack">
+    ELK stack aggregates JSON logs with traceId correlation to Zipkin
+  </Card>
+  <Card title="JWT Security" icon="shield-halved" href="/operations/security">
+    HS384 JWT tokens, BCrypt passwords, Gateway as OAuth2 Resource Server
+  </Card>
+  <Card title="Docker Compose" icon="boxes-stacked" href="/quickstart-docker">
+    Profile-based deployment with health checks and correct startup ordering
+  </Card>
+</CardGroup>
+
+## Technology stack
+
+<CardGroup cols={3}>
+  <Card title="Spring Boot 3.4" icon="leaf">
+    Core application framework with Spring Cloud 2024.0.0
+  </Card>
+  <Card title="Java 21" icon="java">
+    Latest LTS release with modern language features
+  </Card>
+  <Card title="Maven Multi-module" icon="cubes">
+    Single parent POM managing all six service modules
+  </Card>
+  <Card title="Spring Cloud Gateway" icon="route">
+    Reactive API gateway with WebFlux Security
+  </Card>
+  <Card title="Netflix Eureka" icon="server">
+    Client-side service discovery and load balancing
+  </Card>
+  <Card title="Micrometer Tracing" icon="chart-line">
+    Replaces Sleuth for distributed trace context propagation
+  </Card>
+</CardGroup>
+
+## How requests flow
+
+```
+Client
+  └─► API Gateway (8080)          — validates JWT, routes request
+        └─► inventory-service (8082) — hexagonal domain logic, persists to H2
+              └─► Message Broker     — publishes ProductCreatedEvent
+                    └─► notification-service (8084) — logs notification
+```
+
+All services register with Eureka at startup, pull configuration from Config Server, and report traces to Zipkin. Logs flow over TCP to Logstash → Elasticsearch → Kibana.

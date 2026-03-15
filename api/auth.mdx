@@ -1,0 +1,113 @@
+---
+title: "Auth API"
+description: "Authentication endpoints for obtaining JWT tokens."
+---
+
+The auth service issues signed JWT tokens that you include in all subsequent requests to protected endpoints. All requests pass through the API Gateway at `http://localhost:8080`.
+
+<Note>
+  No authentication is required to call `/auth/login`. All other service endpoints require the token returned here.
+</Note>
+
+## Test users
+
+The following users are seeded by default:
+
+| Username | Password | Role |
+| -------- | -------- | ---- |
+| `admin`  | `admin123` | `ROLE_ADMIN` |
+| `user`   | `user123`  | `ROLE_USER`  |
+
+---
+
+## POST /auth/login
+
+Validates credentials and returns a signed JWT Bearer token.
+
+**Endpoint (via API Gateway)**
+
+```
+POST http://localhost:8080/auth/login
+```
+
+### Request body
+
+<ParamField body="username" type="string" required>
+  The account username. Must not be blank.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  The account password. Must not be blank.
+</ParamField>
+
+### Response body (200)
+
+<ResponseField name="token" type="string" required>
+  Signed JWT string. Pass this value in the `Authorization` header of subsequent requests as `Bearer <token>`.
+</ResponseField>
+
+<ResponseField name="type" type="string" required>
+  Token scheme. Always `"Bearer"`.
+</ResponseField>
+
+<ResponseField name="expiresIn" type="number" required>
+  Token lifetime in seconds. Always `3600` (1 hour).
+</ResponseField>
+
+### Error responses
+
+| Status | Meaning |
+| ------ | ------- |
+| `401`  | Invalid username or password. |
+
+### JWT details
+
+- **Algorithm:** HS384 (HMAC-SHA-384)
+- **Expiration:** 1 hour from issue time
+- **Claims:** `sub` (username), `roles` (array of role strings, e.g. `["ROLE_ADMIN"]`), `iat`, `exp`
+
+---
+
+## Examples
+
+### Request
+
+<CodeGroup>
+
+```bash Linux / macOS
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "admin123"}'
+```
+
+```bash Windows CMD
+curl -X POST http://localhost:8080/auth/login ^
+  -H "Content-Type: application/json" ^
+  -d "{\"username\": \"admin\", \"password\": \"admin123\"}"
+```
+
+```powershell Windows PowerShell
+Invoke-RestMethod -Method POST -Uri http://localhost:8080/auth/login `
+  -ContentType "application/json" `
+  -Body '{"username": "admin", "password": "admin123"}'
+```
+
+</CodeGroup>
+
+### Response
+
+```json
+{
+  "token": "eyJhbGciOiJIUzM4NiJ9.eyJzdWIiOiJhZG1pbiIsInJvbGVzIjpbIlJPTEVfQURNSU4iXSwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDB9.SIGNATURE",
+  "type": "Bearer",
+  "expiresIn": 3600
+}
+```
+
+<Tip>
+  Copy the `token` value and include it in all subsequent requests as the `Authorization` header:
+
+  ```
+  Authorization: Bearer <token>
+  ```
+</Tip>

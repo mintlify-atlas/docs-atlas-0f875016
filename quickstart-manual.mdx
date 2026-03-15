@@ -1,0 +1,307 @@
+---
+title: "Manual Setup (Without Docker)"
+description: "Run services natively with lower memory consumption (~1.5–3 GB RAM)."
+---
+
+Running services manually avoids the overhead of Docker containers. This approach uses approximately **1.5–3 GB RAM** compared to the Docker setup which requires ~4–6 GB.
+
+## When to use this approach
+
+Choose manual setup when:
+
+- Your machine has less than 8 GB of RAM
+- You want to avoid Docker Desktop overhead
+- You're iterating quickly and want faster startup times per service
+
+## Prerequisites
+
+Install the following before proceeding:
+
+**Required for all setups:**
+- Java 21
+- Maven 3.9+
+- Erlang/OTP + RabbitMQ **or** Apache Kafka (pick one)
+
+**Optional (for observability):**
+- Zipkin (distributed tracing)
+- Elasticsearch + Logstash + Kibana (centralized logs)
+
+## Step 1 — Install and start your message broker
+
+<Tabs>
+  <Tab title="RabbitMQ (recommended)">
+    RabbitMQ is lighter (~100–200 MB RAM) and simpler to set up than Kafka.
+
+    **1. Install Erlang/OTP:**
+    Download the OTP installer from [https://www.erlang.org/downloads](https://www.erlang.org/downloads) and install it.
+
+    **2. Install RabbitMQ:**
+    Download RabbitMQ Server from [https://www.rabbitmq.com/download.html](https://www.rabbitmq.com/download.html) and install it.
+    Add `C:\Program Files\RabbitMQ Server\rabbitmq_server-X.X.X\sbin\` to your `PATH`.
+
+    **3. Enable the management plugin:**
+    ```cmd
+    rabbitmq-plugins enable rabbitmq_management
+    ```
+
+    **4. Start the broker:**
+    ```cmd
+    rabbitmq-server start
+    ```
+
+    **5. Verify:** Open [http://localhost:15672](http://localhost:15672) — login with `guest` / `guest`.
+  </Tab>
+  <Tab title="Apache Kafka">
+    Kafka uses ~400–600 MB RAM (including Zookeeper).
+
+    **1. Download Kafka:**
+    ```powershell
+    mkdir C:\kafka
+    Invoke-WebRequest -Uri "https://downloads.apache.org/kafka/3.6.0/kafka_2.13-3.6.0.tgz" -OutFile "C:\kafka\kafka.tgz"
+    ```
+
+    **2. Extract:**
+    ```cmd
+    cd C:\kafka
+    tar -xzf kafka.tgz
+    cd kafka_2.13-3.6.0
+    ```
+
+    **3. Configure Zookeeper** — edit `config\zookeeper.properties`:
+    ```
+    dataDir=C:/kafka/zookeeper-data
+    ```
+
+    **4. Configure Kafka** — edit `config\server.properties`:
+    ```
+    log.dirs=C:/kafka/kafka-logs
+    ```
+
+    **5. Create data directories:**
+    ```cmd
+    mkdir C:\kafka\zookeeper-data
+    mkdir C:\kafka\kafka-logs
+    ```
+
+    **6. Start Zookeeper (terminal 1):**
+    ```cmd
+    cd C:\kafka\kafka_2.13-3.6.0
+    bin\windows\zookeeper-server-start.bat config\zookeeper.properties
+    ```
+
+    **7. Start Kafka (terminal 2):**
+    ```cmd
+    cd C:\kafka\kafka_2.13-3.6.0
+    bin\windows\kafka-server-start.bat config\server.properties
+    ```
+
+    **8. Verify:**
+    ```cmd
+    cd C:\kafka\kafka_2.13-3.6.0
+    bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+    ```
+  </Tab>
+</Tabs>
+
+## Step 2 — Start Zipkin (optional)
+
+Skip this if you do not need distributed tracing.
+
+```powershell
+# Download the Zipkin executable JAR
+mkdir C:\zipkin
+Invoke-WebRequest -Uri "https://repo1.maven.org/maven2/io/zipkin/zipkin-server/3.2.0/zipkin-server-3.2.0-exec.jar" -OutFile "C:\zipkin\zipkin.jar"
+```
+
+```cmd
+cd C:\zipkin
+java -jar zipkin.jar
+```
+
+Verify: [http://localhost:9411](http://localhost:9411)
+
+## Step 3 — Start ELK stack (optional)
+
+Skip this if you do not need centralized log aggregation.
+
+1. **Elasticsearch** — download from [https://www.elastic.co/downloads/elasticsearch](https://www.elastic.co/downloads/elasticsearch), then:
+   ```cmd
+   C:\elasticsearch\bin\elasticsearch.bat
+   ```
+
+2. **Logstash** — run with the pipeline bundled in the project:
+   ```cmd
+   cd "C:\Program Files\logstash-8.17.0"
+   bin\logstash.bat -f "C:\path\to\project\logstash\pipeline.conf"
+   ```
+
+3. **Kibana** — download from [https://www.elastic.co/downloads/kibana](https://www.elastic.co/downloads/kibana) (match the Elasticsearch version), then:
+   ```cmd
+   C:\kibana\kibana-8.17.0-windows-x86_64\bin\kibana.bat
+   ```
+
+<Note>
+  Use the same version for Elasticsearch and Kibana. Mismatched versions cause compatibility errors on startup.
+</Note>
+
+Verify each component:
+- Elasticsearch: [http://localhost:9200](http://localhost:9200)
+- Kibana: [http://localhost:5601](http://localhost:5601) (may take 30–60 seconds on first load)
+
+## Step 4 — Start Spring Boot services
+
+Each service runs in its own terminal. Start them in the order shown.
+
+<Warning>
+  You **must** start config-server with the `native` profile. Without it, Spring attempts to use the `git` profile by default and fails with `"Invalid config server configuration"` because no Git repository is configured. The `native` profile tells config-server to read configuration files from the local `config/` directory.
+</Warning>
+
+<Steps>
+  <Step title="Config Server (port 8888)">
+    ```bash
+    cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+
+    Verify: [http://localhost:8888/actuator/health](http://localhost:8888/actuator/health)
+
+    Wait until the health endpoint returns `{"status":"UP"}` before proceeding.
+  </Step>
+
+  <Step title="Eureka Server (port 8761)">
+    ```bash
+    cd eureka-server && mvn spring-boot:run
+    ```
+
+    Verify: [http://localhost:8761](http://localhost:8761)
+
+    Wait for the Eureka dashboard to load before starting application services.
+  </Step>
+
+  <Step title="Auth Service (port 8083)">
+    ```bash
+    cd auth-service && mvn spring-boot:run
+    ```
+
+    Verify registration in Eureka: [http://localhost:8761](http://localhost:8761)
+  </Step>
+
+  <Step title="Inventory Service (port 8082)">
+    Run with the profile matching your broker:
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        ```bash
+        cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+        ```
+      </Tab>
+      <Tab title="Kafka">
+        ```bash
+        cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="API Gateway (port 8080)">
+    Start the gateway **after** auth-service and inventory-service are registered in Eureka. The gateway resolves routes through Eureka — if services are not registered yet, routes will not resolve.
+
+    ```bash
+    cd api-gateway && mvn spring-boot:run
+    ```
+
+    Verify: [http://localhost:8080](http://localhost:8080)
+  </Step>
+
+  <Step title="Notification Service (port 8084)">
+    Use the same broker profile as inventory-service:
+
+    <Tabs>
+      <Tab title="RabbitMQ">
+        ```bash
+        cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+        ```
+      </Tab>
+      <Tab title="Kafka">
+        ```bash
+        cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+</Steps>
+
+## Verification
+
+After all services are running:
+
+```bash
+# Check all services are registered with Eureka
+curl http://localhost:8761/eureka/apps
+
+# Health checks
+curl http://localhost:8080/actuator/health  # API Gateway
+curl http://localhost:8083/actuator/health  # Auth Service
+curl http://localhost:8082/actuator/health  # Inventory Service
+curl http://localhost:8084/actuator/health  # Notification Service
+```
+
+**Verify the broker:**
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    curl http://localhost:15672/api/overview -u guest:guest
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```cmd
+    cd C:\kafka\kafka_2.13-3.6.0
+    bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+    ```
+  </Tab>
+</Tabs>
+
+**End-to-end test:**
+
+```bash
+# 1. Get a JWT token
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+# 2. Create a product (publishes an event to the broker)
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Producto Test","quantity":10,"price":99.99}'
+```
+
+Check the notification-service terminal for the log output confirming the event was received.
+
+## Startup order reference
+
+| Order | Service | Port | Depends on |
+|---|---|---|---|
+| 1 | Config Server | 8888 | — |
+| 2 | Eureka Server | 8761 | Config Server |
+| 3 | Auth Service | 8083 | Eureka |
+| 4 | Inventory Service | 8082 | Eureka, broker |
+| 5 | API Gateway | 8080 | Eureka, Auth Service, Inventory Service |
+| 6 | Notification Service | 8084 | Eureka, broker |
+
+## Memory consumption reference
+
+| Component | RAM usage | Notes |
+|---|---|---|
+| RabbitMQ | 100–200 MB | Recommended broker for low-RAM machines |
+| Kafka + Zookeeper | 400–600 MB | Higher overhead |
+| Elasticsearch | 256–512 MB | Configured with reduced heap for development |
+| Logstash | 100–200 MB | |
+| Kibana | 200–400 MB | ~900 MB–1.1 GB on disk |
+| Zipkin | 100–200 MB | |
+| Spring Boot services (4) | 300–500 MB | ~150 MB each |
+| **Total (approx.)** | **1.5–3 GB** | Depending on which components you activate |
+
+<Note>
+  To minimize memory usage: use RabbitMQ instead of Kafka, skip Zipkin if you don't need tracing, and skip ELK if you don't need centralized logs. With only RabbitMQ and the four Spring Boot services, you can run the core ecosystem in under 800 MB.
+</Note>

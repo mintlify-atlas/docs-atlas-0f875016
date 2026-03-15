@@ -1,0 +1,228 @@
+---
+title: "API Gateway"
+description: "Spring Cloud Gateway acting as the single entry point and OAuth2 Resource Server for the ecosystem."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8080**
+  </Card>
+  <Card title="Health Check" icon="heart">
+    `GET /actuator/health`
+  </Card>
+</CardGroup>
+
+## Overview
+
+The API Gateway is the **single entry point** for all client requests. It:
+
+- Validates the JWT on every request (except `POST /auth/login`)
+- Routes traffic to downstream microservices via Eureka service discovery
+- Propagates the `Authorization` header to downstream services
+
+It is built on Spring WebFlux (reactive stack) and configured as an OAuth2 Resource Server.
+
+## Routing
+
+Routes are defined in `application.yml`. Both routes apply the `AuthorizationHeader` filter:
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: auth-service
+          uri: lb://auth-service
+          predicates:
+            - Path=/auth/**
+          filters:
+            - AuthorizationHeader
+        - id: inventory-service
+          uri: lb://inventory-service
+          predicates:
+            - Path=/api/inventory/**
+          filters:
+            - AuthorizationHeader
+```
+
+| Path Pattern         | Upstream Service   | Auth Required |
+|----------------------|--------------------|---------------|
+| `/auth/**`           | `auth-service`     | No (login)    |
+| `/api/inventory/**`  | `inventory-service`| Yes           |
+
+`lb://` URIs instruct the gateway to resolve the service address via Eureka with client-side load balancing.
+
+## Security Configuration
+
+WebFlux security is configured using `@EnableWebFluxSecurity`. The gateway acts as an OAuth2 Resource Server and decodes JWTs using the shared HMAC-SHA384 secret:
+
+```java
+package com.uade.gateway.config;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
+import org.springframework.security.config.web.server.ServerHttpSecurity;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+import org.springframework.security.web.server.SecurityWebFilterChain;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+
+@Configuration
+@EnableWebFluxSecurity
+public class SecurityConfig {
+
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+
+    @Bean
+    public ReactiveJwtDecoder reactiveJwtDecoder() {
+        SecretKey key = new SecretKeySpec(jwtSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA384");
+        return NimbusReactiveJwtDecoder.withSecretKey(key).macAlgorithm(MacAlgorithm.HS384).build();
+    }
+
+    @Bean
+    public SecurityWebFilterChain securityWebFilterChain(ServerHttpSecurity http) {
+        return http
+            .authorizeExchange(exchange -> exchange
+                .pathMatchers("/auth/**").permitAll()
+                .pathMatchers("/actuator/**", "/h2-console/**").permitAll()
+                .anyExchange().authenticated()
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2
+                .jwt(jwt -> jwt.jwtDecoder(reactiveJwtDecoder()))
+            )
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)
+            .build();
+    }
+}
+```
+
+<Note>
+  The path `/auth/**` is permitted without a token so that clients can call `POST /auth/login` to obtain one. All other paths require a valid `Bearer` token.
+</Note>
+
+## Authorization Header Filter
+
+After the gateway validates the JWT, the `AuthorizationHeaderGatewayFilterFactory` explicitly copies the `Authorization` header onto the mutated downstream request. This guarantees that inventory-service (which also validates the JWT independently) receives the token:
+
+```java
+package com.uade.gateway.filter;
+
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.stereotype.Component;
+
+import java.util.Optional;
+
+/**
+ * GatewayFilter that explicitly propagates the Authorization header to downstream services.
+ * Guarantees that the JWT validated by the Gateway reaches protected microservices.
+ */
+@Component
+public class AuthorizationHeaderGatewayFilterFactory
+        extends AbstractGatewayFilterFactory<AuthorizationHeaderGatewayFilterFactory.Config> {
+
+    private static final String AUTHORIZATION = HttpHeaders.AUTHORIZATION;
+
+    public AuthorizationHeaderGatewayFilterFactory() {
+        super(Config.class);
+    }
+
+    @Override
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            ServerHttpRequest request = exchange.getRequest();
+            Optional<String> authHeader = request.getHeaders().getOrEmpty(AUTHORIZATION).stream().findFirst();
+
+            if (authHeader.isPresent()) {
+                ServerHttpRequest mutatedRequest = request.mutate()
+                        .header(AUTHORIZATION, authHeader.get())
+                        .build();
+                return chain.filter(exchange.mutate().request(mutatedRequest).build());
+            }
+
+            return chain.filter(exchange);
+        };
+    }
+
+    public static class Config {
+        // No additional configuration required
+    }
+}
+```
+
+## Application Configuration
+
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+
+logging:
+  level:
+    org.springframework.cloud.gateway: DEBUG
+    org.springframework.security: DEBUG
+    reactor.netty: DEBUG
+```
+
+## Environment Variables
+
+| Variable                                  | Description                                    | Default                                         |
+|-------------------------------------------|------------------------------------------------|-------------------------------------------------|
+| `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE`    | Eureka registry URL                            | `http://localhost:8761/eureka/`                |
+| `JWT_SECRET`                              | HMAC-SHA384 secret (must match other services) | `MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789` |
+
+## Request Flow
+
+<Steps>
+  <Step title="Client sends request">
+    The client sends a request to `http://localhost:8080` with an `Authorization: Bearer <token>` header.
+  </Step>
+  <Step title="Gateway validates JWT">
+    The `ReactiveJwtDecoder` verifies the token signature and expiry using the shared HS384 secret. An invalid or missing token returns `401 Unauthorized` immediately.
+  </Step>
+  <Step title="AuthorizationHeader filter runs">
+    The `AuthorizationHeaderGatewayFilterFactory` copies the `Authorization` header onto the outgoing request to the downstream service.
+  </Step>
+  <Step title="Request is routed">
+    The gateway resolves the upstream service address via Eureka and forwards the request. The downstream service performs its own JWT validation.
+  </Step>
+</Steps>
+
+## Unauthorized Response
+
+Requests without a token or with an expired/invalid token receive:
+
+```http
+HTTP/1.1 401 Unauthorized
+```
+
+```bash
+# Expect 401
+curl -X GET http://localhost:8080/api/inventory/products
+```

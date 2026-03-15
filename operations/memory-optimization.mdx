@@ -1,0 +1,167 @@
+---
+title: "Memory Optimization"
+description: "Tuning memory consumption for development environments with limited RAM."
+---
+
+## Execution Modes and RAM Usage
+
+The project supports two execution modes with very different memory footprints:
+
+<CardGroup cols={2}>
+  <Card title="Docker Mode" icon="docker">
+    **~4–6 GB RAM**
+
+    Includes all infrastructure (RabbitMQ or Kafka, Elasticsearch, Kibana, Zipkin) plus the Spring Boot services. Fully automated via `docker-compose.yml`. Recommended for initial setup.
+  </Card>
+  <Card title="Manual Mode" icon="terminal">
+    **~1.5–3 GB RAM**
+
+    Uses native OS installations instead of Docker containers. Requires more initial configuration but lets you omit components you don't need.
+  </Card>
+</CardGroup>
+
+## Memory by Component
+
+The following table shows approximate RAM consumption for each component in an optimized development configuration:
+
+| Component | RAM | Notes |
+|-----------|-----|-------|
+| **RabbitMQ** | 100–200 MB | Lightweight; recommended broker for low-RAM setups |
+| **Kafka + Zookeeper** | 400–600 MB | Heavier alternative to RabbitMQ |
+| **Elasticsearch** | 256–512 MB | Heap configured to 512 MB max in Docker Compose |
+| **Logstash** | 100–200 MB | Lightweight log processor |
+| **Kibana** | 200–400 MB RAM + 900 MB–1.1 GB disk | Disk includes embedded Node.js and frontend libs |
+| **Zipkin** | 100–200 MB | Optional; only needed for distributed tracing UI |
+| **Spring Boot services** | 300–500 MB | ~150 MB each; 4 services running simultaneously |
+| **Total (approx.)** | **1.5–3 GB** | Depends on which components are active |
+
+## Elasticsearch JVM Heap Tuning
+
+Elasticsearch is the largest memory consumer in the stack. In `docker-compose.yml` the heap is already limited:
+
+```yaml
+elasticsearch:
+  environment:
+    ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+  deploy:
+    resources:
+      limits:
+        memory: 1g
+```
+
+For a local (non-Docker) Elasticsearch installation, edit `config/jvm.options` in the Elasticsearch directory:
+
+```
+-Xms256m
+-Xmx512m
+```
+
+Setting the minimum heap (`-Xms`) equal to the maximum (`-Xmx`) avoids costly heap resizing but uses the full allocation from the start. Setting a lower minimum (e.g. `256m` min, `512m` max) uses less RAM at idle at the cost of occasional resizing pauses.
+
+## Kibana Memory Settings
+
+Kibana does not expose direct heap tuning like Elasticsearch, but you can reduce its CPU and network usage by editing `config/kibana.yml`:
+
+```yaml
+# Reduce the operations polling interval (default 5000ms)
+ops.interval: 5000
+
+# Limit the maximum request payload size
+server.maxPayloadBytes: 1048576
+
+# Disable usage telemetry
+telemetry.optIn: false
+```
+
+Kibana consumes approximately 200–400 MB of RAM in this baseline configuration.
+
+<Note>
+Kibana's install directory is ~900 MB–1.1 GB on disk because it bundles Node.js and frontend libraries. This is disk usage, not RAM.
+</Note>
+
+## Recommendations by Available RAM
+
+<Tabs>
+  <Tab title="8 GB RAM">
+    You can run the full stack. Use RabbitMQ instead of Kafka and omit Zipkin if you don't need distributed tracing:
+
+    ```bash
+    # Full ELK + RabbitMQ, no Zipkin
+    docker compose --profile rabbitmq up \
+      rabbitmq elasticsearch kibana \
+      config-server eureka-server \
+      auth-service api-gateway \
+      inventory-service-rabbitmq notification-service-rabbitmq
+    ```
+
+    Expected usage: ~3–4 GB RAM.
+  </Tab>
+  <Tab title="4 GB RAM">
+    Skip the ELK stack entirely. Run only the message broker and Spring Boot services:
+
+    ```bash
+    # RabbitMQ + Spring Boot services only
+    docker compose --profile rabbitmq up \
+      rabbitmq \
+      config-server eureka-server \
+      auth-service api-gateway \
+      inventory-service-rabbitmq notification-service-rabbitmq
+    ```
+
+    Expected usage: ~1.5–2 GB RAM.
+  </Tab>
+</Tabs>
+
+## Disabling Optional Components
+
+### Disable Zipkin
+
+If you don't need distributed tracing, simply don't start the Zipkin container. The services will log warnings about failed span exports but will continue to function normally.
+
+Set the sampling probability to `0.0` to suppress the export attempts entirely:
+
+```yaml
+# In application.yml of each service
+management:
+  tracing:
+    sampling:
+      probability: 0.0
+```
+
+### Disable ELK (Elasticsearch, Logstash, Kibana)
+
+If you only need console logs, skip the ELK stack. Services send logs to stdout regardless of whether Logstash is listening on port `5044`. No configuration change is needed — simply don't start Elasticsearch, Logstash, or Kibana.
+
+### Use RabbitMQ instead of Kafka
+
+RabbitMQ uses 100–200 MB vs. Kafka + Zookeeper at 400–600 MB. Unless you specifically need Kafka semantics (log compaction, consumer groups, replay), prefer the RabbitMQ profile:
+
+```bash
+# Lighter — RabbitMQ
+docker compose --profile rabbitmq up --build
+
+# Heavier — Kafka (KRaft mode, no separate Zookeeper container)
+docker compose --profile kafka up --build
+```
+
+<Info>
+The Docker Compose Kafka setup uses Bitnami's Kafka image in **KRaft mode** (no Zookeeper container). Despite this, Kafka still consumes significantly more RAM than RabbitMQ due to JVM overhead.
+</Info>
+
+## Manual Mode Memory Savings
+
+Running dependencies as native OS processes instead of Docker containers avoids container overhead. In manual mode the expected memory footprint drops to ~1.5–3 GB depending on which components you start:
+
+```bash
+# Start only what you need — example: RabbitMQ + Spring Boot services
+rabbitmq-server start
+
+cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+cd eureka-server && mvn spring-boot:run
+cd auth-service && mvn spring-boot:run
+cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+cd api-gateway && mvn spring-boot:run
+cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+```
+
+Each `mvn spring-boot:run` process forks a JVM. Expect approximately 150 MB per Spring Boot service at idle after startup.

@@ -1,0 +1,374 @@
+---
+title: "Troubleshooting"
+description: "Common issues and solutions for running the microservices ecosystem."
+---
+
+<AccordionGroup>
+  <Accordion title="Config Server fails: 'Invalid config server configuration'">
+    **Symptom:** The Config Server exits on startup with an error similar to:
+
+    ```
+    Invalid config server configuration.
+    If you are using the git profile, git or credhub must be configured.
+    ```
+
+    **Cause:** Spring Cloud Config Server defaults to the `git` backend when no profile is specified. Because no Git repository is configured, it fails immediately.
+
+    **Fix:** Always start the Config Server with the `native` profile:
+
+    ```bash
+    # Local Maven
+    cd config-server
+    mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+
+    When using Docker Compose, the profile is already set via environment variable and no manual step is needed:
+
+    ```yaml
+    # docker-compose.yml — config-server section
+    environment:
+      SPRING_PROFILES_ACTIVE: native
+    ```
+
+    The `native` profile tells the Config Server to read configuration files from the local `config/` directory (`search-locations: file:./config` in `config-server/src/main/resources/application.yml`).
+  </Accordion>
+
+  <Accordion title="Services fail to start (wrong startup order)">
+    **Symptom:** One or more services crash or loop on startup with connection errors, Eureka registration failures, or config-fetch errors.
+
+    **Cause:** Services depend on each other being available. Starting them out of order means dependencies aren't ready.
+
+    **Fix:** Follow the correct startup order:
+
+    <Steps>
+      <Step title="Config Server (port 8888)">
+        Must be fully started first. All other services fetch their configuration from it on boot.
+
+        ```bash
+        cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+        ```
+      </Step>
+      <Step title="Eureka Server (port 8761)">
+        Must be running before any service tries to register.
+
+        ```bash
+        cd eureka-server && mvn spring-boot:run
+        ```
+      </Step>
+      <Step title="Auth Service and Inventory Service (ports 8083 / 8082)">
+        Can be started in parallel once Eureka is up.
+
+        ```bash
+        cd auth-service && mvn spring-boot:run
+        cd inventory-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+        ```
+      </Step>
+      <Step title="API Gateway (port 8080)">
+        Start after Auth Service and Inventory Service have registered with Eureka. The gateway uses load-balanced routes (`lb://auth-service`, `lb://inventory-service`) which require Eureka entries to resolve.
+
+        ```bash
+        cd api-gateway && mvn spring-boot:run
+        ```
+      </Step>
+      <Step title="Notification Service (port 8084)">
+        Start last — it depends on the message broker and Eureka.
+
+        ```bash
+        cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+        ```
+      </Step>
+    </Steps>
+
+    Verify all services are registered:
+
+    ```bash
+    curl http://localhost:8761/eureka/apps
+    ```
+  </Accordion>
+
+  <Accordion title="JWT validation fails (401 Unauthorized)">
+    **Symptom:** Login succeeds and returns a token, but using the token on any protected endpoint returns `401 Unauthorized`.
+
+    **Cause:** The `jwt.secret` value differs between `auth-service` (which signed the token) and `api-gateway` or `inventory-service` (which are validating it). The HS384 signature verification fails when the key doesn't match.
+
+    **Fix:** Ensure the exact same secret is set in all three services:
+
+    ```yaml
+    # Must be identical in:
+    # - auth-service/src/main/resources/application.yml
+    # - api-gateway/src/main/resources/application.yml
+    # - inventory-service/src/main/resources/application.yml
+    jwt:
+      secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+    ```
+
+    Also check the Config Server files:
+
+    ```yaml
+    # config-server/config/auth-service.yml
+    jwt:
+      secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+      expiration-ms: 3600000
+    ```
+
+    After updating, restart all three services. To confirm the token is being sent correctly:
+
+    ```bash
+    # Obtain a token
+    TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+    # Test a protected endpoint
+    curl -v http://localhost:8080/api/inventory/products \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Accordion>
+
+  <Accordion title="Elasticsearch fails to start">
+    **Symptom:** The `elasticsearch` container exits immediately or repeatedly restarts. Other ELK components (Kibana, Logstash) are also unavailable.
+
+    **Diagnosis:** Inspect the container logs:
+
+    ```bash
+    docker logs <elasticsearch-container-id>
+    # or using the service name:
+    docker compose logs elasticsearch
+    ```
+
+    Common log errors and their causes:
+    - `max virtual memory areas vm.max_map_count [65530] is too low` — the host OS `vm.max_map_count` needs to be increased.
+    - `bootstrap checks failed` — usually a memory or permissions issue.
+
+    **Fix — increase `vm.max_map_count` (Linux/WSL2):**
+
+    ```bash
+    sudo sysctl -w vm.max_map_count=262144
+    ```
+
+    **Fix — reset the Elasticsearch volume** if data is corrupt:
+
+    ```bash
+    docker compose down elasticsearch
+    docker volume rm microservicios_elasticsearch-data
+    docker compose up elasticsearch -d
+    ```
+
+    After Elasticsearch is healthy, verify:
+
+    ```bash
+    curl http://localhost:9200/_cluster/health
+    ```
+  </Accordion>
+
+  <Accordion title="Logstash not connecting to Elasticsearch">
+    **Symptom:** Logstash starts but logs show connection refused or timeout errors when trying to reach Elasticsearch on port `9200`.
+
+    **Diagnosis steps:**
+
+    <Steps>
+      <Step title="Check Elasticsearch health first">
+        Logstash will fail to connect if Elasticsearch isn't healthy yet. Elasticsearch can take up to 60 seconds to become ready.
+
+        ```bash
+        curl http://localhost:9200/_cluster/health
+        ```
+
+        Wait until `status` is `green` or `yellow` before starting Logstash.
+      </Step>
+      <Step title="Check pipeline.conf">
+        Verify the `output` section in `logstash/pipeline.conf` points to the correct Elasticsearch host:
+
+        ```
+        output {
+          elasticsearch {
+            hosts => ["http://localhost:9200"]
+            ...
+          }
+        }
+        ```
+
+        If running Logstash locally against a Docker Elasticsearch, `localhost:9200` is correct.
+      </Step>
+      <Step title="Check port 9200 firewall/accessibility">
+        Confirm port `9200` is accessible from where Logstash is running:
+
+        ```bash
+        curl -v http://localhost:9200
+        ```
+
+        If you see `Connection refused`, Elasticsearch is either not running or bound to a different interface.
+      </Step>
+    </Steps>
+  </Accordion>
+
+  <Accordion title="No logs appearing in Kibana">
+    **Symptom:** Kibana is running and the `logs-*` index pattern is configured, but the Discover view shows no documents.
+
+    **Diagnosis steps:**
+
+    <Steps>
+      <Step title="Wait 1–2 minutes">
+        Elasticsearch indexes documents asynchronously. After sending requests through the services, wait 1–2 minutes before checking Kibana.
+      </Step>
+      <Step title="Verify Logstash pipeline is running">
+        In the Logstash console output, look for:
+
+        ```
+        Pipeline started successfully {:pipeline_id=>"main"}
+        ```
+
+        If this line is absent, Logstash failed to start its pipeline — check the `pipeline.conf` for syntax errors.
+      </Step>
+      <Step title="Check Logstash TCP port 5044">
+        The Spring Boot services send logs to Logstash via TCP on port `5044`. Verify the port is reachable:
+
+        ```bash
+        # Windows
+        telnet localhost 5044
+
+        # Linux/macOS
+        nc -zv localhost 5044
+        ```
+
+        If the connection is refused, Logstash is not listening (either not started or using a different port).
+      </Step>
+      <Step title="Verify services are generating log output">
+        Make at least one authenticated request to generate log entries:
+
+        ```bash
+        TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+        curl http://localhost:8080/api/inventory/products \
+          -H "Authorization: Bearer $TOKEN"
+        ```
+
+        Confirm that logs appear in the Spring Boot service console output. If they do but Kibana is empty, the issue is in the Logstash → Elasticsearch pipeline.
+      </Step>
+    </Steps>
+  </Accordion>
+
+  <Accordion title="RabbitMQ Management UI not accessible">
+    **Symptom:** Navigating to `http://localhost:15672` returns a connection error or `ERR_CONNECTION_REFUSED`.
+
+    **Diagnosis:**
+
+    ```bash
+    # Check that the RabbitMQ container is running
+    docker compose ps rabbitmq
+
+    # Check the RabbitMQ API (requires guest/guest credentials)
+    curl http://localhost:15672/api/overview -u guest:guest
+    ```
+
+    **Common causes and fixes:**
+
+    - **Wrong Docker profile:** The `rabbitmq` service in `docker-compose.yml` is only started with `--profile rabbitmq`. Make sure you ran:
+
+      ```bash
+      docker compose --profile rabbitmq up --build
+      ```
+
+      Running without the profile flag means the RabbitMQ container is never created.
+
+    - **Management plugin not enabled (manual install):** If running RabbitMQ natively, the management plugin must be explicitly enabled:
+
+      ```cmd
+      rabbitmq-plugins enable rabbitmq_management
+      ```
+
+      Then restart the RabbitMQ service.
+
+    - **Port conflict:** Check that nothing else is bound to port `15672`.
+  </Accordion>
+
+  <Accordion title="Kafka not working / messages not being consumed">
+    **Symptom:** Products are created successfully but the `notification-service` logs show no events received, or the inventory-service logs show Kafka producer errors.
+
+    **Diagnosis:**
+
+    ```bash
+    # Check Kafka container is healthy
+    docker compose ps kafka
+
+    # List topics inside the Kafka container
+    docker exec -it <kafka-container> \
+      kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+    # Windows (local Kafka install)
+    cd C:\kafka\kafka_2.13-3.6.0
+    bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+    ```
+
+    **Common causes and fixes:**
+
+    - **Wrong profile:** Both `inventory-service` and `notification-service` must be started with the `kafka` profile. If either uses `rabbitmq`, the Kafka adapters won't be loaded:
+
+      ```bash
+      cd inventory-service
+      mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+
+      cd notification-service
+      mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+      ```
+
+      In Docker:
+      ```bash
+      docker compose --profile kafka up --build
+      ```
+
+    - **Wrong bootstrap server address:** In Docker, the Kafka broker advertises itself as `kafka:9092` (the container hostname). Services running outside Docker cannot reach this address. For local development outside Docker, ensure:
+
+      ```yaml
+      # application-kafka.yml
+      spring:
+        kafka:
+          bootstrap-servers: localhost:9092
+      ```
+
+      Or set the environment variable:
+      ```bash
+      SPRING_KAFKA_BOOTSTRAP_SERVERS=localhost:9092
+      ```
+
+    - **Topic not created:** Kafka is configured with `KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"` in `docker-compose.yml`, so topics are created automatically on first publish. If auto-creation is disabled in a custom setup, create the topic manually:
+
+      ```bash
+      docker exec -it <kafka-container> \
+        kafka-topics.sh --bootstrap-server localhost:9092 \
+        --create --topic product-created --partitions 1 --replication-factor 1
+      ```
+  </Accordion>
+</AccordionGroup>
+
+## Health Check Commands
+
+Use these commands to verify all services are running correctly after startup:
+
+```bash
+# Spring Boot services
+curl http://localhost:8080/actuator/health   # API Gateway
+curl http://localhost:8083/actuator/health   # Auth Service
+curl http://localhost:8082/actuator/health   # Inventory Service
+curl http://localhost:8084/actuator/health   # Notification Service
+
+# Service registry
+curl http://localhost:8761/eureka/apps
+
+# RabbitMQ
+curl http://localhost:15672/api/overview -u guest:guest
+
+# Kafka (inside container)
+docker exec -it <kafka-container> kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# Elasticsearch
+curl http://localhost:9200/_cluster/health
+
+# Kibana
+curl -f http://localhost:5601/api/status
+
+# Zipkin
+curl http://localhost:9411/api/v2/services
+```

@@ -1,0 +1,149 @@
+---
+title: "Config Server"
+description: "Centralized configuration service for all microservices using Spring Cloud Config with filesystem backend."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8888**
+  </Card>
+  <Card title="Health Check" icon="heart">
+    `GET /actuator/health`
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Config Server provides externalized configuration to all microservices at startup. It uses Spring Cloud Config with the `native` profile, which reads configuration files from a local `config/` directory on the filesystem.
+
+<Warning>
+  The `native` Spring profile is **required**. Without it, Spring Cloud Config defaults to a Git backend and fails with _"Invalid config server configuration"_ because no Git repository is configured. Always start the Config Server with `-Dspring-boot.run.profiles=native`.
+</Warning>
+
+## Application Entry Point
+
+```java
+package com.uade.config;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.config.server.EnableConfigServer;
+
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServerApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigServerApplication.class, args);
+    }
+}
+```
+
+The `@EnableConfigServer` annotation activates Spring Cloud Config Server behavior on this application.
+
+## Configuration
+
+```yaml
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: file:./config
+      fail-fast: false
+```
+
+`search-locations: file:./config` tells the server to serve configuration files from the `config/` directory relative to where the process is started.
+
+## Security
+
+All endpoints are open in development. The `SecurityConfig` permits all requests and disables CSRF:
+
+```java
+package com.uade.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/**", "/encrypt/**", "/decrypt/**").permitAll()
+                .requestMatchers("/**").permitAll()
+            )
+            .csrf(csrf -> csrf.disable());
+
+        return http.build();
+    }
+}
+```
+
+## How Other Services Consume It
+
+Other services import configuration from the Config Server by setting `spring.config.import` or `spring.cloud.config.uri` in their own `application.yml`:
+
+```yaml
+spring:
+  config:
+    import: optional:configserver:http://localhost:8888
+```
+
+The `optional:` prefix prevents the service from failing at startup if the Config Server is temporarily unavailable.
+
+## Starting the Config Server
+
+<Tabs>
+  <Tab title="Maven (manual)">
+    ```bash
+    cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+  </Tab>
+  <Tab title="Docker Compose">
+    The Config Server is included in `docker-compose.yml` and started automatically with the chosen broker profile. Other services declare a `depends_on` health check on it so they wait until it is ready.
+
+    ```bash
+    # Start with RabbitMQ profile (Config Server is included)
+    docker compose --profile rabbitmq up --build
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The Config Server must start **before** all other Spring Boot services. They fetch their configuration from it at boot time and will fail to start if it is not reachable.
+</Note>
+
+## Startup Order
+
+<Steps>
+  <Step title="Start the Config Server">
+    ```bash
+    cd config-server && mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+    Wait until you see the banner and the port `8888` is bound in the logs.
+  </Step>
+  <Step title="Verify the health endpoint">
+    ```bash
+    curl http://localhost:8888/actuator/health
+    ```
+    Expected response:
+    ```json
+    { "status": "UP" }
+    ```
+  </Step>
+  <Step title="Start remaining services">
+    Proceed to start Eureka Server, then the other microservices.
+  </Step>
+</Steps>

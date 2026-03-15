@@ -1,0 +1,352 @@
+---
+title: "Notification Service"
+description: "Event consumer service that logs product creation notifications from RabbitMQ or Kafka."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8084**
+  </Card>
+  <Card title="Role" icon="bell">
+    Pure event consumer — no REST endpoints
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Notification Service is a pure event consumer. It has **no REST endpoints** exposed to users. Its sole responsibility is to listen for `ProductCreatedEvent` messages from the active message broker and log them.
+
+The active broker is selected at runtime via a Spring profile (`rabbitmq` or `kafka`). Switching brokers requires no code changes.
+
+## Application Entry Point
+
+```java
+package com.uade.notification;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+
+@SpringBootApplication
+@EnableDiscoveryClient
+public class NotificationServiceApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(NotificationServiceApplication.class, args);
+    }
+}
+```
+
+## Event DTO
+
+The `ProductCreatedEvent` is the payload received from the broker:
+
+```java
+package com.uade.notification.event;
+
+import java.time.Instant;
+
+public class ProductCreatedEvent {
+
+    private Long productId;
+    private String name;
+    private Integer quantity;
+    private Double price;
+    private Instant timestamp;
+
+    public ProductCreatedEvent() {}
+
+    public Long getProductId()   { return productId; }
+    public void setProductId(Long productId) { this.productId = productId; }
+
+    public String getName()      { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public Integer getQuantity() { return quantity; }
+    public void setQuantity(Integer quantity) { this.quantity = quantity; }
+
+    public Double getPrice()     { return price; }
+    public void setPrice(Double price) { this.price = price; }
+
+    public Instant getTimestamp() { return timestamp; }
+    public void setTimestamp(Instant timestamp) { this.timestamp = timestamp; }
+}
+```
+
+## Listeners
+
+<Tabs>
+  <Tab title="RabbitMQ (@Profile rabbitmq)">
+    ```java
+    package com.uade.notification.listener;
+
+    import com.uade.notification.event.ProductCreatedEvent;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+    import org.springframework.amqp.rabbit.annotation.RabbitListener;
+    import org.springframework.context.annotation.Profile;
+    import org.springframework.stereotype.Component;
+
+    @Component
+    @Profile("rabbitmq")
+    public class ProductEventListener {
+
+        private static final Logger log = LoggerFactory.getLogger(ProductEventListener.class);
+
+        @RabbitListener(queues = "product.created.queue")
+        public void handleProductCreated(ProductCreatedEvent event) {
+            log.info("=== NOTIFICACIÓN RECIBIDA ===");
+            log.info("Nuevo producto creado:");
+            log.info("  ID:       {}", event.getProductId());
+            log.info("  Nombre:   {}", event.getName());
+            log.info("  Cantidad: {}", event.getQuantity());
+            log.info("  Precio:   ${}", event.getPrice());
+            log.info("  Fecha:    {}", event.getTimestamp());
+            log.info("=============================");
+        }
+    }
+    ```
+  </Tab>
+  <Tab title="Kafka (@Profile kafka)">
+    ```java
+    package com.uade.notification.listener;
+
+    import com.uade.notification.event.ProductCreatedEvent;
+    import org.slf4j.Logger;
+    import org.slf4j.LoggerFactory;
+    import org.springframework.context.annotation.Profile;
+    import org.springframework.kafka.annotation.KafkaListener;
+    import org.springframework.stereotype.Component;
+
+    @Component
+    @Profile("kafka")
+    public class KafkaProductEventListener {
+
+        private static final Logger log = LoggerFactory.getLogger(KafkaProductEventListener.class);
+
+        @KafkaListener(topics = "product-created", groupId = "notification-group")
+        public void handleProductCreated(ProductCreatedEvent event) {
+            log.info("=== NOTIFICACIÓN RECIBIDA (Kafka) ===");
+            log.info("Nuevo producto creado:");
+            log.info("  ID:       {}", event.getProductId());
+            log.info("  Nombre:   {}", event.getName());
+            log.info("  Cantidad: {}", event.getQuantity());
+            log.info("  Precio:   ${}", event.getPrice());
+            log.info("  Fecha:    {}", event.getTimestamp());
+            log.info("=====================================");
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Log Output
+
+When a product is created in the inventory service, you will see the following in the notification service console:
+
+<Tabs>
+  <Tab title="RabbitMQ output">
+    ```
+    === NOTIFICACIÓN RECIBIDA ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Monitor
+      Cantidad: 15
+      Precio:   $299.99
+      Fecha:    2026-03-15T12:34:56.789Z
+    =============================
+    ```
+  </Tab>
+  <Tab title="Kafka output">
+    ```
+    === NOTIFICACIÓN RECIBIDA (Kafka) ===
+    Nuevo producto creado:
+      ID:       4
+      Nombre:   Monitor
+      Cantidad: 15
+      Precio:   $299.99
+      Fecha:    2026-03-15T12:34:56.789Z
+    =====================================
+    ```
+  </Tab>
+</Tabs>
+
+## RabbitMQ Configuration
+
+Active when the `rabbitmq` profile is set. Declares a topic exchange, a durable queue, and a binding:
+
+```java
+package com.uade.notification.config;
+
+import org.springframework.amqp.core.*;
+import org.springframework.amqp.support.converter.Jackson2JsonMessageConverter;
+import org.springframework.amqp.support.converter.MessageConverter;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+
+@Configuration
+@Profile("rabbitmq")
+public class RabbitMQConfig {
+
+    public static final String EXCHANGE    = "inventory.exchange";
+    public static final String QUEUE       = "product.created.queue";
+    public static final String ROUTING_KEY = "product.created";
+
+    @Bean
+    public TopicExchange inventoryExchange() {
+        return new TopicExchange(EXCHANGE);
+    }
+
+    @Bean
+    public Queue productCreatedQueue() {
+        return QueueBuilder.durable(QUEUE).build();
+    }
+
+    @Bean
+    public Binding productCreatedBinding(Queue productCreatedQueue, TopicExchange inventoryExchange) {
+        return BindingBuilder.bind(productCreatedQueue).to(inventoryExchange).with(ROUTING_KEY);
+    }
+
+    @Bean
+    public MessageConverter jsonMessageConverter() {
+        return new Jackson2JsonMessageConverter();
+    }
+}
+```
+
+| Property     | Value                   |
+|--------------|-------------------------|
+| Exchange     | `inventory.exchange`    |
+| Queue        | `product.created.queue` |
+| Routing key  | `product.created`       |
+| Queue type   | Durable                 |
+| Serializer   | Jackson (JSON)          |
+
+## Kafka Configuration
+
+Active when the `kafka` profile is set. Configures a consumer factory and listener container factory targeting `localhost:9092` by default:
+
+```java
+package com.uade.notification.config;
+
+import com.uade.notification.event.ProductCreatedEvent;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@Profile("kafka")
+public class KafkaConfig {
+
+    public static final String TOPIC = "product-created";
+
+    @Value("${spring.kafka.bootstrap-servers:localhost:9092}")
+    private String bootstrapServers;
+
+    @Bean
+    public ConsumerFactory<String, ProductCreatedEvent> consumerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, "notification-group");
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        config.put(JsonDeserializer.TRUSTED_PACKAGES, "*");
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return new DefaultKafkaConsumerFactory<>(config);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, ProductCreatedEvent> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, ProductCreatedEvent> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory());
+        return factory;
+    }
+}
+```
+
+| Property       | Value                  |
+|----------------|------------------------|
+| Topic          | `product-created`      |
+| Consumer group | `notification-group`   |
+| Bootstrap      | `localhost:9092`       |
+| Offset reset   | `earliest`             |
+| Deserializer   | Jackson (JSON)         |
+
+## Application Configuration
+
+```yaml
+server:
+  port: 8084
+
+spring:
+  application:
+    name: notification-service
+
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://localhost:9411/api/v2/spans
+
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-}] "
+```
+
+## Starting the Notification Service
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    cd notification-service && mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+    ```
+  </Tab>
+  <Tab title="Docker Compose">
+    ```bash
+    # The correct service variant is included automatically based on the chosen profile
+    docker compose --profile rabbitmq up --build
+    # or
+    docker compose --profile kafka up --build
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  There is no persistence layer. The service logs events to stdout only. No database or REST endpoints are involved.
+</Note>
+
+## No REST Endpoints
+
+The Notification Service does not expose any REST API. The only network traffic it initiates is:
+
+- Registering with Eureka on startup
+- Consuming messages from the active broker
+- Optionally reporting traces to Zipkin
+
+There is no `/actuator/health` endpoint accessible via the API Gateway for this service.

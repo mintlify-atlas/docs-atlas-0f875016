@@ -1,0 +1,308 @@
+---
+title: "Configuration"
+description: "How centralized configuration works via Spring Cloud Config Server with the native filesystem profile."
+---
+
+## Overview
+
+All microservices in this ecosystem pull their configuration from a central **Spring Cloud Config Server** running on port `8888`. On startup, each service fetches its configuration by making a request to:
+
+```
+http://localhost:8888/<service-name>/<profile>
+```
+
+The Config Server reads configuration files from the local `config/` directory inside `config-server/`. The following files are served:
+
+| File | Served to |
+|------|-----------|
+| `config/application.yml` | All services (shared defaults) |
+| `config/auth-service.yml` | auth-service only |
+| `config/api-gateway.yml` | api-gateway only |
+| `config/inventory-service.yml` | inventory-service only |
+| `config/eureka-server.yml` | eureka-server only |
+
+## The `native` Profile
+
+<Warning>
+The Config Server **must** be started with the `native` Spring profile. Without it, Spring Cloud Config defaults to a `git` backend and fails immediately with:
+
+```
+Invalid config server configuration
+```
+
+Because no Git repository is configured. The `native` profile switches the backend to read files from the local filesystem.
+</Warning>
+
+The `native` profile is configured in `config-server/src/main/resources/application.yml`:
+
+```yaml
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        native:
+          search-locations: file:./config
+      fail-fast: false
+```
+
+The `search-locations: file:./config` path is relative to the working directory where the Config Server process is launched — in practice the `config-server/` module root when running with Maven, or the container root when running with Docker.
+
+### Starting the Config Server with the native profile
+
+<Tabs>
+  <Tab title="Maven (local)">
+    ```bash
+    cd config-server
+    mvn spring-boot:run -Dspring-boot.run.profiles=native
+    ```
+  </Tab>
+  <Tab title="Docker">
+    In `docker-compose.yml` the environment variable is already set:
+    ```yaml
+    config-server:
+      environment:
+        SPRING_PROFILES_ACTIVE: native
+    ```
+
+    So running either Docker Compose command automatically activates the correct profile:
+    ```bash
+    docker compose --profile rabbitmq up --build
+    # or
+    docker compose --profile kafka up --build
+    ```
+  </Tab>
+</Tabs>
+
+## Environment Variables per Service
+
+The following environment variables are set in `docker-compose.yml` and override the defaults from the Config Server files. For local development without Docker the defaults in each `application.yml` apply instead (pointing to `localhost`).
+
+### config-server
+
+```yaml
+environment:
+  SPRING_PROFILES_ACTIVE: native
+```
+
+### eureka-server
+
+```yaml
+environment:
+  EUREKA_INSTANCE_HOSTNAME: eureka-server
+```
+
+### auth-service
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+### api-gateway
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+### inventory-service (RabbitMQ profile)
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  SPRING_PROFILES_ACTIVE: rabbitmq
+  SPRING_RABBITMQ_HOST: rabbitmq
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+### inventory-service (Kafka profile)
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  SPRING_PROFILES_ACTIVE: kafka
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+### notification-service (RabbitMQ profile)
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  SPRING_PROFILES_ACTIVE: rabbitmq
+  SPRING_RABBITMQ_HOST: rabbitmq
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+### notification-service (Kafka profile)
+
+```yaml
+environment:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka/
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+  SPRING_PROFILES_ACTIVE: kafka
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  MANAGEMENT_ZIPKIN_TRACING_ENDPOINT: http://zipkin:9411/api/v2/spans
+```
+
+## Key Configuration Properties
+
+### Service Discovery (`EUREKA_CLIENT_SERVICEURL_DEFAULTZONE`)
+
+All services register with and discover each other through Eureka. The default for local development is `http://localhost:8761/eureka/`. In Docker, this is overridden to use the container hostname:
+
+```yaml
+# Local default (in application.yml of each service)
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+```
+
+```bash
+# Docker override (docker-compose.yml)
+EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://eureka-server:8761/eureka/
+```
+
+### Active Profile (`SPRING_PROFILES_ACTIVE`)
+
+Determines which message broker adapter is loaded. Valid values are `rabbitmq` or `kafka`.
+
+| Profile | Broker loaded | Services that use it |
+|---------|---------------|----------------------|
+| `rabbitmq` | RabbitMQ (port 5672) | inventory-service, notification-service |
+| `kafka` | Apache Kafka (port 9092) | inventory-service, notification-service |
+| `native` | Filesystem config backend | config-server only |
+
+### Distributed Tracing (`MANAGEMENT_ZIPKIN_TRACING_ENDPOINT`)
+
+All services ship traces to Zipkin. Locally the endpoint defaults to `http://localhost:9411/api/v2/spans`. In Docker it is overridden to resolve the Zipkin container:
+
+```bash
+MANAGEMENT_ZIPKIN_TRACING_ENDPOINT=http://zipkin:9411/api/v2/spans
+```
+
+The sampling probability is configured per service:
+
+```yaml
+management:
+  tracing:
+    sampling:
+      probability: 0.0   # Set to 1.0 during active development/debugging
+```
+
+### Message Broker Hosts
+
+<Tabs>
+  <Tab title="RabbitMQ">
+    ```bash
+    # Docker environment variable
+    SPRING_RABBITMQ_HOST=rabbitmq
+
+    # Local default (application-rabbitmq.yml)
+    spring:
+      rabbitmq:
+        host: localhost
+        port: 5672
+    ```
+  </Tab>
+  <Tab title="Kafka">
+    ```bash
+    # Docker environment variable
+    SPRING_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+
+    # Local default (application-kafka.yml)
+    spring:
+      kafka:
+        bootstrap-servers: localhost:9092
+    ```
+  </Tab>
+</Tabs>
+
+## JWT Secret Configuration
+
+<Warning>
+The JWT secret **must be identical** across `auth-service`, `api-gateway`, and `inventory-service`. If they differ, tokens generated by `auth-service` will fail validation at the gateway and inventory service, resulting in `401 Unauthorized` errors on every request.
+</Warning>
+
+The secret is defined in `config-server/config/auth-service.yml` and in each service's own `application.yml` as a fallback:
+
+```yaml
+jwt:
+  secret: MiClaveSecretaParaJWT_MuyLarga_Y_Segura_123456789
+  expiration-ms: 3600000   # 1 hour — only read by auth-service
+```
+
+The `api-gateway` and `inventory-service` only use `jwt.secret` (not `expiration-ms`) because they only validate tokens, never generate them.
+
+To change the secret across all services, update the value in:
+1. `config-server/config/auth-service.yml`
+2. `auth-service/src/main/resources/application.yml`
+3. `api-gateway/src/main/resources/application.yml`
+4. `inventory-service/src/main/resources/application.yml`
+
+## Docker vs Local Development
+
+<Tabs>
+  <Tab title="Docker">
+    When running with Docker Compose all inter-service hostnames resolve via Docker's internal DNS (e.g. `eureka-server`, `rabbitmq`, `kafka`, `zipkin`). Environment variables in `docker-compose.yml` override the localhost defaults automatically. No manual changes to `application.yml` files are needed.
+
+    ```bash
+    # With RabbitMQ
+    docker compose --profile rabbitmq up --build
+
+    # With Kafka
+    docker compose --profile kafka up --build
+    ```
+  </Tab>
+  <Tab title="Local (manual)">
+    All services use `localhost` by default. Start them in the following order so that each dependency is ready before the next service tries to register:
+
+    ```bash
+    # Terminal 1 — Config Server (port 8888) — MUST use native profile
+    cd config-server
+    mvn spring-boot:run -Dspring-boot.run.profiles=native
+
+    # Terminal 2 — Eureka Server (port 8761)
+    cd eureka-server
+    mvn spring-boot:run
+
+    # Terminal 3 — Auth Service (port 8083)
+    cd auth-service
+    mvn spring-boot:run
+
+    # Terminal 4 — Inventory Service (port 8082)
+    cd inventory-service
+    mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    # or for Kafka:
+    # mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+
+    # Terminal 5 — API Gateway (port 8080) — start after services register in Eureka
+    cd api-gateway
+    mvn spring-boot:run
+
+    # Terminal 6 — Notification Service (port 8084)
+    cd notification-service
+    mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+    # or for Kafka:
+    # mvn spring-boot:run -Dspring-boot.run.profiles=kafka
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+The API Gateway should be started **after** the other services have registered with Eureka. If the gateway starts too early it may not be able to resolve the `lb://auth-service` and `lb://inventory-service` routes immediately, though it will retry on the next request.
+</Note>

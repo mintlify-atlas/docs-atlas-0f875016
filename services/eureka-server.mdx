@@ -1,0 +1,160 @@
+---
+title: "Eureka Server"
+description: "Netflix Eureka service discovery registry for the microservices ecosystem."
+---
+
+<CardGroup cols={2}>
+  <Card title="Port" icon="server">
+    **8761**
+  </Card>
+  <Card title="Dashboard" icon="browser">
+    [http://localhost:8761](http://localhost:8761)
+  </Card>
+</CardGroup>
+
+## Overview
+
+The Eureka Server is the service discovery registry for the entire microservices ecosystem. Every service registers itself here on startup, and client services use Eureka to resolve the network location of other services by name rather than hardcoded addresses.
+
+Spring Cloud Gateway uses Eureka to route requests via load-balanced URIs like `lb://auth-service`.
+
+## Application Entry Point
+
+```java
+package com.uade.eureka;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.cloud.netflix.eureka.server.EnableEurekaServer;
+
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(EurekaServerApplication.class, args);
+    }
+}
+```
+
+The `@EnableEurekaServer` annotation activates the Eureka discovery registry.
+
+## Configuration
+
+```yaml
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server
+
+eureka:
+  instance:
+    hostname: localhost
+  client:
+    register-with-eureka: false
+    fetch-registry: false
+    service-url:
+      defaultZone: http://${eureka.instance.hostname}:${server.port}/eureka/
+```
+
+`register-with-eureka: false` and `fetch-registry: false` prevent the Eureka Server from registering with itself, which is the correct standalone configuration.
+
+## Security
+
+Security is intentionally minimal in development. CSRF is disabled and the `/eureka/**` and `/actuator/**` paths are open without authentication:
+
+```java
+package com.uade.eureka;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/eureka/**", "/actuator/**").permitAll()
+                .anyRequest().authenticated()
+            );
+
+        return http.build();
+    }
+}
+```
+
+<Note>
+  The Eureka dashboard at `http://localhost:8761` is accessible without authentication in development.
+</Note>
+
+## How Services Register
+
+Each client service sets the `eureka.client.service-url.defaultZone` property (or the equivalent `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` environment variable) to point at the registry:
+
+```yaml
+eureka:
+  instance:
+    prefer-ip-address: true
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka/
+```
+
+Services annotated with `@EnableDiscoveryClient` (or any `@SpringBootApplication` with the Eureka client on the classpath) will self-register automatically on startup.
+
+## Starting the Eureka Server
+
+<Tabs>
+  <Tab title="Maven (manual)">
+    ```bash
+    cd eureka-server && mvn spring-boot:run
+    ```
+    Start this **after** the Config Server and **before** all other microservices.
+  </Tab>
+  <Tab title="Docker Compose">
+    The Eureka Server is included in `docker-compose.yml` and started automatically.
+
+    ```bash
+    docker compose --profile rabbitmq up --build
+    ```
+  </Tab>
+</Tabs>
+
+## Health Check
+
+```bash
+curl http://localhost:8761/actuator/health
+```
+
+Expected response:
+```json
+{ "status": "UP" }
+```
+
+To see all registered services:
+
+```bash
+curl http://localhost:8761/eureka/apps
+```
+
+## Web Dashboard
+
+Open [http://localhost:8761](http://localhost:8761) in a browser. The dashboard shows:
+
+- All registered application instances and their status (`UP` / `DOWN`)
+- Instance IP addresses and ports
+- Lease renewal and expiry information
+
+<Info>
+  Allow 30–60 seconds after starting a service for it to appear in the dashboard. Eureka uses heartbeat intervals for registration and health tracking.
+</Info>

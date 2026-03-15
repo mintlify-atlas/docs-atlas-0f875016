@@ -1,0 +1,193 @@
+---
+title: "Architecture Overview"
+description: "System design, component relationships, and request flow across the microservices ecosystem."
+---
+
+## System Diagram
+
+```
+                          ┌─────────────────────────────────┐
+                          │         Client / Browser        │
+                          └────────────────┬────────────────┘
+                                           │ HTTP
+                                           ▼
+                          ┌─────────────────────────────────┐
+                          │    API Gateway  (port 8080)      │
+                          │  Spring Cloud Gateway            │
+                          │  OAuth2 Resource Server (JWT)    │
+                          └────────┬──────────────┬──────────┘
+                                   │              │
+                      /auth/login  │              │ /api/inventory/**
+                                   ▼              ▼
+               ┌──────────────────────┐  ┌──────────────────────┐
+               │   auth-service       │  │  inventory-service    │
+               │   (port 8083)        │  │  (port 8082)          │
+               │   JWT, BCrypt, H2    │  │  Hexagonal Arch, H2   │
+               └──────────────────────┘  └──────────┬───────────┘
+                                                     │
+                                          1. Save to H2
+                                          2. Publish event
+                                                     │
+                                        ┌────────────▼───────────┐
+                                        │     Message Broker      │
+                                        │                         │
+                                        │  Profile: rabbitmq      │
+                                        │  inventory.exchange     │
+                                        │  product.created.queue  │
+                                        │         OR              │
+                                        │  Profile: kafka         │
+                                        │  topic: product-created │
+                                        └────────────┬───────────┘
+                                                     │
+                                          Consume event
+                                                     ▼
+                                        ┌────────────────────────┐
+                                        │  notification-service   │
+                                        │  (port 8084)            │
+                                        │  Logs notification      │
+                                        └────────────────────────┘
+
+  ┌─────────────────┐    ┌──────────────────┐    ┌────────────────────┐
+  │  config-server  │    │  eureka-server   │    │      Zipkin        │
+  │  (port 8888)    │    │  (port 8761)     │    │  (port 9411)       │
+  │  Centralized    │    │  Service         │    │  Distributed       │
+  │  configuration  │    │  Discovery       │    │  Tracing           │
+  └─────────────────┘    └──────────────────┘    └────────────────────┘
+
+  ┌─────────────────┐    ┌──────────────────┐    ┌────────────────────┐
+  │ Elasticsearch   │    │    Logstash      │    │      Kibana        │
+  │  (port 9200)    │    │  (port 5044)     │    │  (port 5601)       │
+  │  Log storage    │    │  Log pipeline    │    │  Log UI            │
+  └─────────────────┘    └──────────────────┘    └────────────────────┘
+```
+
+## Spring Boot Services
+
+<CardGroup cols={2}>
+  <Card title="config-server" icon="gear">
+    **Port 8088** — Centralized configuration server using the `native` profile to serve
+    configuration files from the local filesystem. All other services fetch their
+    `application.yml` from here at startup.
+  </Card>
+  <Card title="eureka-server" icon="satellite-dish">
+    **Port 8761** — Netflix Eureka service registry. Every Spring Boot service registers
+    itself on startup. The API Gateway uses Eureka to resolve downstream service URLs
+    without hard-coding addresses.
+  </Card>
+  <Card title="auth-service" icon="lock">
+    **Port 8083** — Issues and validates JWT tokens (HS384, jjwt). Stores users in an
+    in-memory H2 database. Passwords are hashed with BCrypt. Exposes `POST /auth/login`
+    through the gateway.
+  </Card>
+  <Card title="api-gateway" icon="shield">
+    **Port 8080** — Spring Cloud Gateway acting as the single entry point. Configured as
+    an OAuth2 Resource Server: it validates the JWT on every inbound request and propagates
+    the `Authorization` header to downstream services.
+  </Card>
+  <Card title="inventory-service" icon="box">
+    **Port 8082** — Protected microservice that manages products. Implements
+    [Hexagonal Architecture](/architecture/hexagonal) (Ports & Adapters). Persists data
+    to an in-memory H2 database and publishes a `ProductCreatedEvent` to the active
+    message broker on every product creation.
+  </Card>
+  <Card title="notification-service" icon="bell">
+    **Port 8084** — Event consumer. Listens to the active message broker and logs a
+    structured notification whenever a `ProductCreatedEvent` arrives. See
+    [Event-Driven Architecture](/architecture/event-driven) for details.
+  </Card>
+</CardGroup>
+
+## Infrastructure Services
+
+<CardGroup cols={2}>
+  <Card title="RabbitMQ" icon="rabbit">
+    **Ports 5672 / 15672** — Message broker option 1. Uses a `TopicExchange` named
+    `inventory.exchange`, a durable queue `product.created.queue`, and routing key
+    `product.created`. Management UI available at `http://localhost:15672` (guest/guest).
+  </Card>
+  <Card title="Apache Kafka" icon="bolt">
+    **Port 9092** — Message broker option 2. Runs in KRaft mode (no Zookeeper required).
+    Publishes and consumes on the topic `product-created`. Auto-topic creation is enabled.
+  </Card>
+  <Card title="Zipkin" icon="chart-line">
+    **Port 9411** — Distributed tracing UI powered by Micrometer Tracing + Brave. Every
+    service reports spans at 100% sampling rate in development. Correlates requests
+    across all services via a shared `traceId`.
+  </Card>
+  <Card title="ELK Stack" icon="magnifying-glass">
+    **Elasticsearch (9200) · Logstash (5044) · Kibana (5601)** — Centralized log
+    aggregation. Services ship JSON logs via TCP to Logstash, which indexes them into
+    Elasticsearch daily indices (`logs-YYYY.MM.dd`). Kibana provides search and
+    visualization.
+  </Card>
+</CardGroup>
+
+## Request Flow
+
+<Steps>
+  <Step title="Client authenticates">
+    The client sends `POST /auth/login` to the API Gateway with username and password.
+    The gateway routes the request to **auth-service**, which validates the credentials
+    against the H2 database, hashes with BCrypt, and returns a signed JWT.
+
+    ```bash
+    curl -X POST http://localhost:8080/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"username":"admin","password":"admin123"}'
+    ```
+  </Step>
+  <Step title="Gateway validates the JWT">
+    For every subsequent request the client includes the token in
+    `Authorization: Bearer <token>`. The API Gateway validates the JWT signature before
+    forwarding the request. A missing or invalid token returns `401 Unauthorized`.
+  </Step>
+  <Step title="Gateway routes to inventory-service via Eureka">
+    Requests matching `/api/inventory/**` are load-balanced to **inventory-service**
+    using the service name registered in Eureka. The `Authorization` header is propagated
+    downstream. inventory-service re-validates the token as an OAuth2 Resource Server.
+  </Step>
+  <Step title="inventory-service processes the request">
+    The `InventoryController` delegates to `ProductService` (application layer) which
+    calls `ProductRepositoryPort` to persist data to H2, then calls `EventPublisherPort`
+    to emit a `ProductCreatedEvent` to the active broker.
+  </Step>
+  <Step title="notification-service consumes the event">
+    The `ProductEventListener` (RabbitMQ) or `KafkaProductEventListener` (Kafka) receives
+    the event asynchronously and logs a structured notification. No HTTP call is made
+    between the two services.
+  </Step>
+</Steps>
+
+## Service Communication Patterns
+
+| Pattern | Participants | Mechanism |
+|---|---|---|
+| Synchronous HTTP | Client → Gateway → auth-service / inventory-service | Spring Cloud Gateway + Eureka load balancing |
+| Asynchronous messaging | inventory-service → notification-service | RabbitMQ or Kafka (Spring Profiles) |
+| Configuration fetch | All services → config-server | Spring Cloud Config Client (HTTP on startup) |
+| Service registration | All services → eureka-server | Netflix Eureka Client (heartbeat) |
+| Distributed tracing | All services → Zipkin | Micrometer Tracing + Brave reporter |
+| Log shipping | All services → Logstash → Elasticsearch | Logback TCP appender (JSON) |
+
+<Note>
+  The message broker is **switchable via Spring Profiles** — no code changes are required.
+  Run with `--profile rabbitmq` to activate RabbitMQ adapters, or `--profile kafka` to
+  activate Kafka adapters in both `inventory-service` and `notification-service`.
+</Note>
+
+## Port Reference
+
+| Service | Port | UI / Notes |
+|---|---|---|
+| `api-gateway` | 8080 | Single external entry point |
+| `auth-service` | 8083 | H2 console: `http://localhost:8083/h2-console` |
+| `inventory-service` | 8082 | H2 console: `http://localhost:8082/h2-console` |
+| `notification-service` | 8084 | No UI — event consumer only |
+| `config-server` | 8888 | Serves YAML config files |
+| `eureka-server` | 8761 | Dashboard: `http://localhost:8761` |
+| `RabbitMQ` | 5672 / 15672 | Management UI on 15672 (guest/guest) |
+| `Apache Kafka` | 9092 | KRaft mode, no Zookeeper |
+| `Zipkin` | 9411 | Tracing UI: `http://localhost:9411` |
+| `Elasticsearch` | 9200 | REST API |
+| `Logstash` | 5044 | TCP log ingestion |
+| `Kibana` | 5601 | Log UI: `http://localhost:5601` |
